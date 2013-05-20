@@ -80,13 +80,26 @@ tarEntry () = go
                     let blocks = blockSize tarEntry
                     in do
                         respond $ Left tarEntry
-                        takeBytes blocks >>= respond . Right
+                        respondBytes blocks
                         go
                 Left e -> error (show e)
             else return ()
 
     blockSize e = 512 * ceiling (fromIntegral (entrySize e) / 512)
 
+    respondBytes x = go x
+      where
+        go n = do
+            got <- drawMay
+            case got of
+                Nothing ->
+                  parseFail $ "Stream did not produce " ++ show x ++ " bytes"
+                Just g ->
+                  let l = BS.length g
+                  in if l > n
+                      then let (need, rest) = BS.splitAt n g
+                           in unDraw rest >> respond (Right need)
+                      else respond (Right g) >> go (n - l)
 
 --------------------------------------------------------------------------------
 takeBytes :: (Monad m, Proxy p) =>
