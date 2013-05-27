@@ -1,9 +1,9 @@
 {-# LANGUAGE DeriveDataTypeable #-}
 module Control.Proxy.Tar
     ( tarArchive
-    , TarParseState
     , tarEntry
     , TarEntry(..)
+    , TarParseState
     ) where
 
 --------------------------------------------------------------------------------
@@ -84,7 +84,7 @@ data EntryType = File | Directory
 --------------------------------------------------------------------------------
 instance Serialize TarEntry where
     get = TarEntry <$> parseASCII 100
-                   <*> (fmap (CMode . fromIntegral) $ readOctal 7) <* Get.skip 1
+                   <*> fmap (CMode . fromIntegral) (readOctal 7) <* Get.skip 1
                    <*> readOctal 7 <* Get.skip 1
                    <*> readOctal 7 <* Get.skip 1
                    <*> readOctal 11 <* Get.skip 1
@@ -143,6 +143,14 @@ tarArchive () = fix $ \loop -> do
 -- This example uses respond composition ('Pipes./>/') to join in the tar
 -- entry handler, introduced with @\e@. This allows you to perform some logic on
 -- each 'TarEntry' - deciding how/whether you want to process each entry.
+--
+-- There is one caveat with 'tarEntry', which is: you can only stream the last
+-- value produced by 'tarArchive'. So if you were to use pull composition and
+-- 'Pipes.request'ed multiple 'TarEntry's - you can only call 'tarEntry' on the
+-- latest 'TarEntry' that upstream responds with. Use of other 'tarEntry's will
+-- type check, but the contents streamed will be the latest tar entry - not the
+-- one passed in! If you use respond composition ('Pipes./>/') you should never
+-- encounter this problem.
 tarEntry :: (Monad m, Pipes.Proxy p)
     => TarEntry
     -> () -> Pipes.Pipe (State.StateP TarParseState p)
@@ -155,7 +163,7 @@ tarEntry entry () = case entryType entry of
         mbs <- Handle.zoom pushBack Handle.draw
         forM_ mbs $ \bs -> do
             let len = BS.length bs
-            if (len <= remainder)
+            if len <= remainder
                 then do
                     Handle.zoom bytesRead $ do
                         Sum n <- State.get
@@ -172,7 +180,10 @@ tarEntry entry () = case entryType entry of
 --------------------------------------------------------------------------------
 drawBytes :: (Monad m, Pipes.Proxy p)
     => Int
-    -> State.StateP [Maybe BS.ByteString] p () (Maybe BS.ByteString) b' b m BS.ByteString
+    -> State.StateP [Maybe BS.ByteString] p
+        () (Maybe BS.ByteString)
+        b' b
+        m BS.ByteString
 drawBytes = loop id
   where
     loop diffBs remainder
@@ -183,7 +194,7 @@ drawBytes = loop id
                 Nothing -> return $ BS.concat (diffBs [])
                 Just bs -> do
                     let len = BS.length bs
-                    if (len <= remainder)
+                    if len <= remainder
                         then loop (diffBs . (bs:)) (remainder - len)
                         else do
                             let (prefix, suffix) = BS.splitAt remainder bs
@@ -196,18 +207,13 @@ skipBytes :: (Monad m, Pipes.Proxy p)
     => Int -> State.StateP [Maybe BS.ByteString] p () (Maybe BS.ByteString) b' b m ()
 skipBytes = loop
   where
-    loop remainder =
-        if (remainder > 0)
-        then do
-            mbs <- Handle.draw
-            case mbs of
-                Nothing -> return ()
-                Just bs -> do
-                    let len = BS.length bs
-                    if (len <= remainder)
-                        then loop (remainder - len)
-                        else do
-                            let (_, suffix) = BS.splitAt remainder bs
-                            Handle.unDraw (Just suffix)
-                            return ()
-        else return ()
+    loop remainder = when (remainder > 0) $ do
+        mbs <- Handle.draw
+        forM_ mbs $ \bs -> do
+            let len = BS.length bs
+            if len <= remainder
+                then loop (remainder - len)
+                else do
+                    let (_, suffix) = BS.splitAt remainder bs
+                    Handle.unDraw (Just suffix)
+                    return ()
