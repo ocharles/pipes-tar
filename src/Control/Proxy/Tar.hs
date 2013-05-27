@@ -28,6 +28,8 @@ import qualified Data.Serialize.Get as Get
 
 
 --------------------------------------------------------------------------------
+-- | 'TarParseState' is internal state that keeps track of how much of a file
+-- has been read.
 data TarParseState = TarParseState [Maybe BS.ByteString] (Sum Int)
 
 pushBack :: Functor f => ([Maybe BS.ByteString] -> f [Maybe BS.ByteString])
@@ -45,6 +47,7 @@ instance Monoid TarParseState where
 
 
 --------------------------------------------------------------------------------
+-- | A 'TarEntry' contains all the metadata about a single entry in a tar file.
 data TarEntry = TarEntry { entryName :: !String
                          , entryMode :: !ByteString
                          , entryUID :: !ByteString
@@ -71,10 +74,12 @@ instance Serialize TarEntry where
                    <*  Get.getBytes 255
       where readOctal = maybe mzero (return . fst) . Lexing.readOctal
 
-    put = undefined
+    put = error "TarEntry serialization is not implemented"
 
 
 --------------------------------------------------------------------------------
+-- | Transform a 'BS.ByteString' into a stream of 'TarEntry's. Each 'TarEntry'
+-- can be expanded into its respective 'BS.ByteString' using 'tarEntry'.
 tarArchive :: (Monad m, Pipes.Proxy p)
     => () -> Pipes.Pipe (State.StateP TarParseState (Maybe.MaybeP p))
                 (Maybe BS.ByteString) TarEntry m ()
@@ -96,6 +101,15 @@ tarArchive () = fix $ \loop -> do
 
 
 --------------------------------------------------------------------------------
+-- | Expand a 'TarEntry' into a 'BS.ByteString'. The intended usage here is
+-- you nest this call inside the 'Pipes.Proxy' downstream of 'tarArchive'.
+-- For example:
+--
+-- > tarArchive />/ (\e -> tarEntry e >-> writeFile (entryName e))
+--
+-- This example uses respond composition ('Pipes./>/') to join in the tar
+-- entry handler, introduced with @\e@. This allows you to perform some logic on
+-- each 'TarEntry' - deciding how/whether you want to process each entry.
 tarEntry :: (Monad m, Pipes.Proxy p)
     => TarEntry
     -> () -> Pipes.Pipe (State.StateP TarParseState p)
@@ -111,18 +125,18 @@ tarEntry entry () = loop (entrySize entry)
                 Just bs -> do
                     let len = BS.length bs
                     if (len <= remainder)
-                    then do
-                        Handle.zoom bytesRead $ do
-                            Sum n <- State.get
-                            State.put $! Sum (n + len)
-                        Pipes.respond mbs
-                        loop (remainder - len)
-                    else do
-                        let (prefix, suffix) = BS.splitAt remainder bs
-                        Handle.zoom pushBack $ Handle.unDraw (Just suffix)
-                        Handle.zoom bytesRead $ State.put (Sum (entrySize entry))
-                        Pipes.respond (Just prefix)
-                        forever $ Pipes.respond Nothing
+                        then do
+                            Handle.zoom bytesRead $ do
+                                Sum n <- State.get
+                                State.put $! Sum (n + len)
+                            Pipes.respond mbs
+                            loop (remainder - len)
+                        else do
+                            let (prefix, suffix) = BS.splitAt remainder bs
+                            Handle.zoom pushBack $ Handle.unDraw (Just suffix)
+                            Handle.zoom bytesRead $ State.put (Sum (entrySize entry))
+                            Pipes.respond (Just prefix)
+                            forever $ Pipes.respond Nothing
         else forever $ Pipes.respond Nothing
 
 
@@ -162,9 +176,9 @@ skipBytes = loop
                 Just bs -> do
                     let len = BS.length bs
                     if (len <= remainder)
-                    then loop (remainder - len)
-                    else do
-                        let (_, suffix) = BS.splitAt remainder bs
-                        Handle.unDraw (Just suffix)
-                        return ()
+                        then loop (remainder - len)
+                        else do
+                            let (_, suffix) = BS.splitAt remainder bs
+                            Handle.unDraw (Just suffix)
+                            return ()
         else return ()
