@@ -9,9 +9,9 @@ module Control.Proxy.Tar
 --------------------------------------------------------------------------------
 import Control.Applicative
 import Control.Exception
-import Control.Monad (forever, mzero)
-import Data.ByteString (ByteString)
+import Control.Monad (mzero, when)
 import Data.Function (fix)
+import Data.Foldable (forM_)
 import Data.Monoid ((<>), Monoid(..), Sum(..))
 import Data.Serialize (Serialize(..), decode)
 import Data.Serialize.Get ()
@@ -146,31 +146,27 @@ tarArchive () = fix $ \loop -> do
 tarEntry :: (Monad m, Pipes.Proxy p)
     => TarEntry
     -> () -> Pipes.Pipe (State.StateP TarParseState p)
-        (Maybe BS.ByteString) (Maybe BS.ByteString) m r
-tarEntry entry () = loop (entrySize entry)
+        (Maybe BS.ByteString) BS.ByteString m ()
+tarEntry entry () = case entryType entry of
+    File -> loop (entrySize entry)
+    _ -> return ()
   where
-    loop remainder =
-        if (remainder > 0)
-        then do
-            mbs <- Handle.zoom pushBack Handle.draw
-            case mbs of
-                Nothing -> forever $ Pipes.respond Nothing
-                Just bs -> do
-                    let len = BS.length bs
-                    if (len <= remainder)
-                        then do
-                            Handle.zoom bytesRead $ do
-                                Sum n <- State.get
-                                State.put $! Sum (n + len)
-                            Pipes.respond mbs
-                            loop (remainder - len)
-                        else do
-                            let (prefix, suffix) = BS.splitAt remainder bs
-                            Handle.zoom pushBack $ Handle.unDraw (Just suffix)
-                            Handle.zoom bytesRead $ State.put (Sum (entrySize entry))
-                            Pipes.respond (Just prefix)
-                            forever $ Pipes.respond Nothing
-        else forever $ Pipes.respond Nothing
+    loop remainder = when (remainder > 0) $ do
+        mbs <- Handle.zoom pushBack Handle.draw
+        forM_ mbs $ \bs -> do
+            let len = BS.length bs
+            if (len <= remainder)
+                then do
+                    Handle.zoom bytesRead $ do
+                        Sum n <- State.get
+                        State.put $! Sum (n + len)
+                    Pipes.respond bs
+                    loop (remainder - len)
+                else do
+                    let (prefix, suffix) = BS.splitAt remainder bs
+                    Handle.zoom pushBack $ Handle.unDraw (Just suffix)
+                    Handle.zoom bytesRead $ State.put (Sum (entrySize entry))
+                    Pipes.respond prefix
 
 
 --------------------------------------------------------------------------------
