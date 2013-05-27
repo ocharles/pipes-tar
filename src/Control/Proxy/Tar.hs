@@ -1,3 +1,4 @@
+{-# LANGUAGE DeriveDataTypeable #-}
 module Control.Proxy.Tar
     ( tarArchive
     , TarParseState
@@ -7,19 +8,21 @@ module Control.Proxy.Tar
 
 --------------------------------------------------------------------------------
 import Control.Applicative
+import Control.Exception
 import Control.Monad (forever, mzero)
 import Data.ByteString (ByteString)
 import Data.Function (fix)
 import Data.Monoid ((<>), Monoid(..), Sum(..))
 import Data.Serialize (Serialize(..), decode)
 import Data.Serialize.Get ()
+import Data.Typeable (Typeable)
 import Data.Word ()
 
 
 --------------------------------------------------------------------------------
 import qualified Control.Proxy as Pipes
 import qualified Control.Proxy.Handle as Handle
-import qualified Control.Proxy.Trans.Maybe as Maybe
+import qualified Control.Proxy.Trans.Either as Either
 import qualified Control.Proxy.Trans.State as State
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as Char8
@@ -45,6 +48,15 @@ instance Monoid TarParseState where
         TarParseState (pbA <> pbB) (brA <> brB)
     mempty = TarParseState mempty mempty
 
+
+--------------------------------------------------------------------------------
+-- | Possible errors that can occur when reading tar files
+data TarException
+  = -- | The header for a tar entry could not be parsed
+    InvalidHeader
+  deriving (Show, Typeable)
+
+instance Exception TarException
 
 --------------------------------------------------------------------------------
 -- | A 'TarEntry' contains all the metadata about a single entry in a tar file.
@@ -79,14 +91,17 @@ instance Serialize TarEntry where
 
 --------------------------------------------------------------------------------
 -- | Transform a 'BS.ByteString' into a stream of 'TarEntry's. Each 'TarEntry'
--- can be expanded into its respective 'BS.ByteString' using 'tarEntry'.
+-- can be expanded into its respective 'BS.ByteString' using 'tarEntry'. Parsing
+-- tar archives can fail, so you may wish to use the @pipes-safe@ library, which
+-- is compatible with 'Pipes.Proxy'.
 tarArchive :: (Monad m, Pipes.Proxy p)
-    => () -> Pipes.Pipe (State.StateP TarParseState (Maybe.MaybeP p))
+    => () -> Pipes.Pipe
+                (State.StateP TarParseState (Either.EitherP SomeException p))
                 (Maybe BS.ByteString) TarEntry m ()
 tarArchive () = fix $ \loop -> do
     header <- Handle.zoom pushBack $ drawBytes 512
     case decode header of
-        Left _ -> mzero
+        Left _ -> Pipes.liftP . Either.left . toException $ InvalidHeader
         Right e -> do
             Handle.zoom bytesRead $ State.put (Sum 0)
             Pipes.respond e
