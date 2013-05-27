@@ -15,8 +15,11 @@ import Data.Function (fix)
 import Data.Monoid ((<>), Monoid(..), Sum(..))
 import Data.Serialize (Serialize(..), decode)
 import Data.Serialize.Get ()
+import Data.Time (UTCTime)
+import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 import Data.Typeable (Typeable)
 import Data.Word ()
+import System.Posix.Types (CMode(..), FileMode)
 
 
 --------------------------------------------------------------------------------
@@ -35,18 +38,20 @@ import qualified Data.Serialize.Get as Get
 -- has been read.
 data TarParseState = TarParseState [Maybe BS.ByteString] (Sum Int)
 
-pushBack :: Functor f => ([Maybe BS.ByteString] -> f [Maybe BS.ByteString])
-                      -> TarParseState -> f TarParseState
-pushBack f (TarParseState pb s) = fmap (\x -> TarParseState x s) (f pb)
-
-bytesRead :: Functor f => (Sum Int -> f (Sum Int))
-                       -> TarParseState -> f TarParseState
-bytesRead f (TarParseState pb s) = fmap (\x -> TarParseState pb x) (f s)
-
 instance Monoid TarParseState where
     mappend (TarParseState pbA brA) (TarParseState pbB brB) =
         TarParseState (pbA <> pbB) (brA <> brB)
     mempty = TarParseState mempty mempty
+
+-- Lens into push-back buffer
+pushBack :: Functor f => ([Maybe BS.ByteString] -> f [Maybe BS.ByteString])
+                      -> TarParseState -> f TarParseState
+pushBack f (TarParseState pb s) = fmap (\x -> TarParseState x s) (f pb)
+
+-- Lens into the amount of bytes read
+bytesRead :: Functor f => (Sum Int -> f (Sum Int))
+                       -> TarParseState -> f TarParseState
+bytesRead f (TarParseState pb s) = fmap (\x -> TarParseState pb x) (f s)
 
 
 --------------------------------------------------------------------------------
@@ -61,30 +66,43 @@ instance Exception TarException
 --------------------------------------------------------------------------------
 -- | A 'TarEntry' contains all the metadata about a single entry in a tar file.
 data TarEntry = TarEntry { entryName :: !String
-                         , entryMode :: !ByteString
-                         , entryUID :: !ByteString
-                         , entryGID :: !ByteString
+                         , entryMode :: !FileMode
+                         , entryUID :: !Int
+                         , entryGID :: !Int
                          , entrySize :: !Int
-                         , entryLastModified :: !ByteString
-                         , entryType :: !ByteString
-                         , entryLinkName :: !ByteString
+                         , entryLastModified :: !UTCTime
+                         , entryType :: !EntryType
+                         , entryLinkName :: !String
                          }
-    deriving (Show)
+    deriving (Eq, Show)
+
+
+data EntryType = File | Directory
+    deriving (Eq, Show)
 
 
 --------------------------------------------------------------------------------
 instance Serialize TarEntry where
-    get = TarEntry <$> (Char8.unpack . BS.takeWhile (/= 0) <$> Get.getBytes 100)
-                   <*> Get.getBytes 7 <* Get.skip 1
-                   <*> Get.getBytes 7 <* Get.skip 1
-                   <*> Get.getBytes 7 <* Get.skip 1
-                   <*> (Get.getBytes 11 >>= readOctal) <* Get.skip 1
-                   <*> Get.getBytes 10 <* Get.skip 2
-                   <*> Get.getBytes 6 <* Get.skip 2
-                   <*> Get.getBytes 1
-                   <*  Get.getBytes 99 <* Get.skip 1
+    get = TarEntry <$> parseASCII 100
+                   <*> (fmap (CMode . fromIntegral) $ readOctal 7) <* Get.skip 1
+                   <*> readOctal 7 <* Get.skip 1
+                   <*> readOctal 7 <* Get.skip 1
+                   <*> readOctal 11 <* Get.skip 1
+                   <*> (posixSecondsToUTCTime . fromInteger <$> readOctal 11)
+                   <* Get.skip 9
+                   <*> (Get.getWord8 >>= parseType . toEnum . fromIntegral)
+                   <*> parseASCII 100
                    <*  Get.getBytes 255
-      where readOctal = maybe mzero (return . fst) . Lexing.readOctal
+      where
+        readOctal n =
+            Get.getBytes n >>= maybe mzero (return . fst) . Lexing.readOctal
+
+        parseType '\0' = return File
+        parseType '0' = return File
+        parseType '5' = return Directory
+        parseType x = error . show $ x
+
+        parseASCII n = Char8.unpack . BS.takeWhile (/= 0) <$> Get.getBytes n
 
     put = error "TarEntry serialization is not implemented"
 
