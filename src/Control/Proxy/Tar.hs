@@ -1,28 +1,47 @@
-{-# LANGUAGE NoMonomorphismRestriction #-}
-module Control.Proxy.Tar where
+module Control.Proxy.Tar
+    ( tarArchive
+    , TarParseState
+    , tarEntry
+    , TarEntry(..)
+    ) where
 
 --------------------------------------------------------------------------------
 import Control.Applicative
-import Control.Exception (SomeException)
-import Control.Proxy.Core
-import Control.Proxy.Parse (ParseP, parse, parseFail, unDraw, drawMay)
-import Control.Proxy.Core.Correct (runProxy)
-import Control.Proxy.ByteString (fromHandleS)
-import Control.Proxy.Trans.Either (EitherP, runEitherK)
-import Control.Proxy.Trans.Writer (execWriterK)
+import Control.Monad (forever, mzero)
 import Data.ByteString (ByteString)
 import Data.Function (fix)
-import Data.Char (ord)
+import Data.Monoid ((<>), Monoid(..), Sum(..))
 import Data.Serialize (Serialize(..), decode)
 import Data.Serialize.Get ()
 import Data.Word ()
-import System.IO (openFile, IOMode(ReadMode), Handle)
 
 
 --------------------------------------------------------------------------------
+import qualified Control.Proxy as Pipes
+import qualified Control.Proxy.Handle as Handle
+import qualified Control.Proxy.Trans.Maybe as Maybe
+import qualified Control.Proxy.Trans.State as State
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as Char8
+import qualified Data.ByteString.Lex.Integral as Lexing
 import qualified Data.Serialize.Get as Get
+
+
+--------------------------------------------------------------------------------
+data TarParseState = TarParseState [Maybe BS.ByteString] (Sum Int)
+
+pushBack :: Functor f => ([Maybe BS.ByteString] -> f [Maybe BS.ByteString])
+                      -> TarParseState -> f TarParseState
+pushBack f (TarParseState pb s) = fmap (\x -> TarParseState x s) (f pb)
+
+bytesRead :: Functor f => (Sum Int -> f (Sum Int))
+                       -> TarParseState -> f TarParseState
+bytesRead f (TarParseState pb s) = fmap (\x -> TarParseState pb x) (f s)
+
+instance Monoid TarParseState where
+    mappend (TarParseState pbA brA) (TarParseState pbB brB) =
+        TarParseState (pbA <> pbB) (brA <> brB)
+    mempty = TarParseState mempty mempty
 
 
 --------------------------------------------------------------------------------
@@ -44,88 +63,108 @@ instance Serialize TarEntry where
                    <*> Get.getBytes 7 <* Get.skip 1
                    <*> Get.getBytes 7 <* Get.skip 1
                    <*> Get.getBytes 7 <* Get.skip 1
-                   <*> (readOctal <$> Get.getBytes 11) <* Get.skip 1
+                   <*> (Get.getBytes 11 >>= readOctal) <* Get.skip 1
                    <*> Get.getBytes 10 <* Get.skip 2
                    <*> Get.getBytes 6 <* Get.skip 2
                    <*> Get.getBytes 1
                    <*  Get.getBytes 99 <* Get.skip 1
                    <*  Get.getBytes 255
+      where readOctal = maybe mzero (return . fst) . Lexing.readOctal
 
     put = undefined
 
 
 --------------------------------------------------------------------------------
-readOctal :: ByteString -> Int
-readOctal = sum .
-    map (\(pow, n) -> n * (8 ^ (pow :: Int))) . zip [0..] .
-    map (\x -> fromIntegral x - (ord '0')) . reverse . BS.unpack
+tarArchive :: (Monad m, Pipes.Proxy p)
+    => () -> Pipes.Pipe (State.StateP TarParseState (Maybe.MaybeP p))
+                (Maybe BS.ByteString) TarEntry m ()
+tarArchive () = fix $ \loop -> do
+    header <- Handle.zoom pushBack $ drawBytes 512
+    case decode header of
+        Left _ -> mzero
+        Right e -> do
+            Handle.zoom bytesRead $ State.put (Sum 0)
+            Pipes.respond e
+            Sum consumed <- State.gets (getConst . bytesRead Const)
+            Handle.zoom pushBack $ skipBytes (tarBlocks e - consumed)
+            loop
+
+  where
+
+    tarBlocks entry = (((entrySize entry - 1) `div` 512) + 1) * 512
+
 
 
 --------------------------------------------------------------------------------
--- | Parse entries out of a tar file.
-tarEntry :: Proxy p => () -> ParseP
-                               ByteString (EitherP SomeException p)
-                               () (Maybe ByteString)
-                               () (Either TarEntry ByteString)
-                               IO
-                               ()
-tarEntry () = go
+tarEntry :: (Monad m, Pipes.Proxy p)
+    => TarEntry
+    -> () -> Pipes.Pipe (State.StateP TarParseState p)
+        (Maybe BS.ByteString) (Maybe BS.ByteString) m r
+tarEntry entry () = loop (entrySize entry)
   where
-    go = do
-        header <- takeBytes 512
-
-        if (not (BS.null header) && any (/= 0) (BS.unpack header))
-            then case decode header of
-                Right tarEntry ->
-                    let blocks = blockSize tarEntry
-                    in do
-                        respond $ Left tarEntry
-                        respondBytes blocks
-                        go
-                Left e -> error (show e)
-            else return ()
-
-    blockSize e = 512 * ceiling (fromIntegral (entrySize e) / 512)
-
-    respondBytes x = go x
-      where
-        go n = do
-            got <- drawMay
-            case got of
-                Nothing ->
-                  parseFail $ "Stream did not produce " ++ show x ++ " bytes"
-                Just g ->
-                  let l = BS.length g
-                  in if l > n
-                      then let (need, rest) = BS.splitAt n g
-                           in unDraw rest >> respond (Right need)
-                      else respond (Right g) >> go (n - l)
-
---------------------------------------------------------------------------------
-takeBytes :: (Monad m, Proxy p) =>
-    Int -> ParseP ByteString (EitherP SomeException p)
-            () (Maybe ByteString)
-            () b
-            m ByteString
-takeBytes x = go x
-  where
-    go n = do
-        got <- drawMay
-        case got of
-            Nothing ->
-              parseFail $ "Stream did not produce " ++ show x ++ " bytes"
-            Just g ->
-              let l = BS.length g
-              in if l > n
-                  then let (need, rest) = BS.splitAt n g
-                       in unDraw rest >> return need
-                  else (g `BS.append`) <$> go (n - l)
+    loop remainder =
+        if (remainder > 0)
+        then do
+            mbs <- Handle.zoom pushBack Handle.draw
+            case mbs of
+                Nothing -> forever $ Pipes.respond Nothing
+                Just bs -> do
+                    let len = BS.length bs
+                    if (len <= remainder)
+                    then do
+                        Handle.zoom bytesRead $ do
+                            Sum n <- State.get
+                            State.put $! Sum (n + len)
+                        Pipes.respond mbs
+                        loop (remainder - len)
+                    else do
+                        let (prefix, suffix) = BS.splitAt remainder bs
+                        Handle.zoom pushBack $ Handle.unDraw (Just suffix)
+                        Handle.zoom bytesRead $ State.put (Sum (entrySize entry))
+                        Pipes.respond (Just prefix)
+                        forever $ Pipes.respond Nothing
+        else forever $ Pipes.respond Nothing
 
 
 --------------------------------------------------------------------------------
--- | Find all the entries in a tar file.
-tarEntries :: Handle -> IO (Either SomeException [TarEntry])
-tarEntries h = runProxy $ runEitherK $ execWriterK $
-    liftP . parse (fromHandleS h) tarEntry >-> takeL >-> toListD
+drawBytes :: (Monad m, Pipes.Proxy p)
+    => Int
+    -> State.StateP [Maybe BS.ByteString] p () (Maybe BS.ByteString) b' b m BS.ByteString
+drawBytes = loop id
   where
-    takeL = foreverK $ \() -> request () >>= either respond (const $ takeL ())
+    loop diffBs remainder
+        | remainder <= 0 = return $ BS.concat (diffBs [])
+        | otherwise = do
+            mbs <- Handle.draw
+            case mbs of
+                Nothing -> return $ BS.concat (diffBs [])
+                Just bs -> do
+                    let len = BS.length bs
+                    if (len <= remainder)
+                        then loop (diffBs . (bs:)) (remainder - len)
+                        else do
+                            let (prefix, suffix) = BS.splitAt remainder bs
+                            Handle.unDraw (Just suffix)
+                            return $ BS.concat (diffBs [prefix])
+
+
+--------------------------------------------------------------------------------
+skipBytes :: (Monad m, Pipes.Proxy p)
+    => Int -> State.StateP [Maybe BS.ByteString] p () (Maybe BS.ByteString) b' b m ()
+skipBytes = loop
+  where
+    loop remainder =
+        if (remainder > 0)
+        then do
+            mbs <- Handle.draw
+            case mbs of
+                Nothing -> return ()
+                Just bs -> do
+                    let len = BS.length bs
+                    if (len <= remainder)
+                    then loop (remainder - len)
+                    else do
+                        let (_, suffix) = BS.splitAt remainder bs
+                        Handle.unDraw (Just suffix)
+                        return ()
+        else return ()
