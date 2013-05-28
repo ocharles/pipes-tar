@@ -115,6 +115,12 @@ instance Serialize TarEntry where
 -- can be expanded into its respective 'BS.ByteString' using 'tarEntry'. Parsing
 -- tar archives can fail, so you may wish to use the @pipes-safe@ library, which
 -- is compatible with 'Pipes.Proxy'.
+--
+-- Users should note that when 'tarArchive' is combined with 'tarEntry' using
+-- 'Pipes./>/' (for example, 'tarArchive' 'Pipes./>/' 'flip' 'tarEntry' @()),
+-- then 'tarArchive' will have control of terminating the entire 'Proxy' and
+-- *not* the down-stream handler. This means that the entire archive will always
+-- be streamed, whether or not you consume all files.
 tarArchive :: (Monad m, Pipes.Proxy p)
     => () -> Pipes.Pipe
                 (State.StateP TarParseState (Either.EitherP SomeException p))
