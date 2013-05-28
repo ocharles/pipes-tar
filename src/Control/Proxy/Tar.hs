@@ -60,6 +60,8 @@ bytesRead f (TarParseState pb s) = fmap (\x -> TarParseState pb x) (f s)
 data TarException
   = -- | The header for a tar entry could not be parsed
     InvalidHeader
+  | -- | The EOF marker in the archive could not be parsed
+    InvalidEOF
   deriving (Show, Typeable)
 
 instance Exception TarException
@@ -119,16 +121,26 @@ tarArchive :: (Monad m, Pipes.Proxy p)
                 (Maybe BS.ByteString) TarEntry m ()
 tarArchive () = fix $ \loop -> do
     header <- Handle.zoom pushBack $ drawBytes 512
-    case decode header of
-        Left _ -> Pipes.liftP . Either.left . toException $ InvalidHeader
-        Right e -> do
-            Handle.zoom bytesRead $ State.put (Sum 0)
-            Pipes.respond e
-            Sum consumed <- State.gets (getConst . bytesRead Const)
-            Handle.zoom pushBack $ passBytes (tarBlocks e - consumed)
-            loop
+
+    if BS.all (== 0) header
+        then parseEOF
+        else parseHeader header loop
 
   where
+    parseHeader header loop =
+        case decode header of
+            Left _ -> Pipes.liftP . Either.left . toException $ InvalidHeader
+            Right e -> do
+                Handle.zoom bytesRead $ State.put (Sum 0)
+                Pipes.respond e
+                Sum consumed <- State.gets (getConst . bytesRead Const)
+                Handle.zoom pushBack $ passBytes (tarBlocks e - consumed)
+                loop
+
+    parseEOF = do
+        part2 <- Handle.zoom pushBack $ drawBytes 512
+        when (BS.all (/= 0) part2) $
+            Pipes.liftP . Either.left . toException $ InvalidEOF
 
     tarBlocks entry = (((entrySize entry - 1) `div` 512) + 1) * 512
 
