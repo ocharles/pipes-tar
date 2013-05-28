@@ -10,6 +10,7 @@ module Control.Proxy.Tar
 import Control.Applicative
 import Control.Exception
 import Control.Monad (mzero, when)
+import Control.Proxy.Handle.ByteString (drawBytes, passBytes)
 import Data.Function (fix)
 import Data.Foldable (forM_)
 import Data.Monoid ((<>), Monoid(..), Sum(..))
@@ -124,7 +125,7 @@ tarArchive () = fix $ \loop -> do
             Handle.zoom bytesRead $ State.put (Sum 0)
             Pipes.respond e
             Sum consumed <- State.gets (getConst . bytesRead Const)
-            Handle.zoom pushBack $ skipBytes (tarBlocks e - consumed)
+            Handle.zoom pushBack $ passBytes (tarBlocks e - consumed)
             loop
 
   where
@@ -177,43 +178,3 @@ tarEntry entry () = case entryType entry of
                     Pipes.respond prefix
 
 
---------------------------------------------------------------------------------
-drawBytes :: (Monad m, Pipes.Proxy p)
-    => Int
-    -> State.StateP [Maybe BS.ByteString] p
-        () (Maybe BS.ByteString)
-        b' b
-        m BS.ByteString
-drawBytes = loop id
-  where
-    loop diffBs remainder
-        | remainder <= 0 = return $ BS.concat (diffBs [])
-        | otherwise = do
-            mbs <- Handle.draw
-            case mbs of
-                Nothing -> return $ BS.concat (diffBs [])
-                Just bs -> do
-                    let len = BS.length bs
-                    if len <= remainder
-                        then loop (diffBs . (bs:)) (remainder - len)
-                        else do
-                            let (prefix, suffix) = BS.splitAt remainder bs
-                            Handle.unDraw (Just suffix)
-                            return $ BS.concat (diffBs [prefix])
-
-
---------------------------------------------------------------------------------
-skipBytes :: (Monad m, Pipes.Proxy p)
-    => Int -> State.StateP [Maybe BS.ByteString] p () (Maybe BS.ByteString) b' b m ()
-skipBytes = loop
-  where
-    loop remainder = when (remainder > 0) $ do
-        mbs <- Handle.draw
-        forM_ mbs $ \bs -> do
-            let len = BS.length bs
-            if len <= remainder
-                then loop (remainder - len)
-                else do
-                    let (_, suffix) = BS.splitAt remainder bs
-                    Handle.unDraw (Just suffix)
-                    return ()
