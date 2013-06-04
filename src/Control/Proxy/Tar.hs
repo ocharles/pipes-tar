@@ -12,7 +12,7 @@ module Control.Proxy.Tar
 --------------------------------------------------------------------------------
 import Control.Applicative
 import Control.Exception
-import Control.Monad (mzero, when)
+import Control.Monad (msum, mzero, when)
 import Control.Proxy ((>->))
 import Control.Proxy.ByteString (passBytesUpTo)
 import Data.Function (fix)
@@ -64,7 +64,7 @@ bytesRead f (TarParseState pb s) = fmap (\x -> TarParseState pb x) (f s)
 -- | Possible errors that can occur when reading tar files
 data TarException
   = -- | The header for a tar entry could not be parsed
-    InvalidHeader
+    InvalidHeader BS.ByteString
   | -- | The EOF marker in the archive could not be parsed
     InvalidEOF
   deriving (Show, Typeable)
@@ -95,15 +95,22 @@ instance Serialize TarEntry where
                    <*> fmap (CMode . fromIntegral) (readOctal 7) <* Get.skip 1
                    <*> readOctal 7 <* Get.skip 1
                    <*> readOctal 7 <* Get.skip 1
-                   <*> readOctal 11 <* Get.skip 1
-                   <*> (posixSecondsToUTCTime . fromInteger <$> readOctal 11)
+                   <*> readOctal 12
+                   <*> (posixSecondsToUTCTime . fromIntegral <$> readOctal 11)
                    <* Get.skip 9
                    <*> (Get.getWord8 >>= parseType . toEnum . fromIntegral)
                    <*> parseASCII 100
                    <*  Get.getBytes 255
       where
         readOctal n =
-            Get.getBytes n >>= maybe mzero (return . fst) . Lexing.readOctal
+            Get.getBytes n >>= \x ->
+                msum [ maybe mzero (return . fst) . Lexing.readOctal $ BS.take 11 x
+                     , return (readBase256 x)
+                     ]
+
+        readBase256 :: BS.ByteString -> Int
+        readBase256 = foldl (\acc x -> acc * 256 + fromIntegral x) 0 .
+          BS.unpack . BS.drop 1
 
         parseType '\0' = return File
         parseType '0' = return File
@@ -138,7 +145,8 @@ tarArchive () = fix $ \loop -> do
   where
     parseHeader header loop =
         case decode header of
-            Left _ -> Pipes.liftP . Either.left . toException $ InvalidHeader
+            Left _ -> Pipes.liftP . Either.left . toException $
+                InvalidHeader header
             Right e -> do
                 Parse.zoom bytesRead $ State.put (Sum 0)
                 Pipes.respond e
