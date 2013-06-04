@@ -7,6 +7,8 @@ module Control.Proxy.Tar
 
     , TarP
     , runTarK
+
+    , TarException(..)
     ) where
 
 --------------------------------------------------------------------------------
