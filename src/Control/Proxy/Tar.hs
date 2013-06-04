@@ -143,7 +143,7 @@ tarArchive () = fix $ \loop -> do
                 Parse.zoom bytesRead $ State.put (Sum 0)
                 Pipes.respond e
                 Sum consumed <- State.gets (getConst . bytesRead Const)
-                Parse.zoom pushBack $ passBytes (tarBlocks e - consumed)
+                Parse.zoom pushBack $ skipBytes (tarBlocks e - consumed)
                 loop
 
     parseEOF = do
@@ -220,7 +220,7 @@ drawBytes n = (passBytesUpTo n >-> const go) ()
 
 
 --------------------------------------------------------------------------------
-passBytes :: (Monad m, Pipes.Proxy p) =>
+skipBytes :: (Monad m, Pipes.Proxy p) =>
     Int -> State.StateP [BS.ByteString] p () (Maybe BS.ByteString) y' y m ()
-passBytes n = (passBytesUpTo n >-> const go) ()
+skipBytes n = (passBytesUpTo n >-> const go) ()
   where go = Pipes.request () >>= maybe (return ()) (const go)
