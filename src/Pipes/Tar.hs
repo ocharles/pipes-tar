@@ -1,12 +1,12 @@
 {-# LANGUAGE DeriveDataTypeable #-}
-module Control.Proxy.Tar
+module Pipes.Tar
     ( tarArchive
     , tarEntry
     , TarEntry(..)
     , TarParseState
 
-    , TarP
-    , runTarK
+    , TarT
+    , runTarP
 
     , TarException(..)
     ) where
@@ -15,8 +15,8 @@ module Control.Proxy.Tar
 import Control.Applicative
 import Control.Exception
 import Control.Monad (msum, mzero, when)
-import Control.Proxy ((>->))
-import Control.Proxy.ByteString (passBytesUpTo)
+import Control.Monad.Trans.Class (lift)
+import Pipes.ByteString (drawBytesUpTo, skipBytesUpTo)
 import Data.Function (fix)
 import Data.Foldable (forM_)
 import Data.Monoid ((<>), Monoid(..), Sum(..))
@@ -30,10 +30,12 @@ import System.Posix.Types (CMode(..), FileMode)
 
 
 --------------------------------------------------------------------------------
-import qualified Control.Proxy as Pipes
-import qualified Control.Proxy.Parse as Parse
-import qualified Control.Proxy.Trans.Either as Either
-import qualified Control.Proxy.Trans.State as State
+import qualified Pipes
+import qualified Pipes.Lift as Pipes
+import qualified Pipes.Internal as PI
+import qualified Control.Monad.Trans.Either as Either
+import qualified Control.Monad.Trans.State.Strict as State
+import qualified Pipes.Parse as Parse
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as Char8
 import qualified Data.ByteString.Lex.Integral as Lexing
@@ -135,10 +137,10 @@ instance Serialize TarEntry where
 -- then 'tarArchive' will have control of terminating the entire 'Proxy' and
 -- *not* the down-stream handler. This means that the entire archive will always
 -- be streamed, whether or not you consume all files.
-tarArchive :: (Monad m, Pipes.Proxy p)
-    => () -> Pipes.Pipe (TarP p) (Maybe BS.ByteString) TarEntry m ()
+tarArchive :: Monad m
+    => () -> Pipes.Pipe (Maybe BS.ByteString) TarEntry (TarT m) ()
 tarArchive () = fix $ \loop -> do
-    header <- Parse.zoom pushBack $ drawBytes 512
+    header <- Parse.zoom pushBack $ drawBytesUpTo 512
 
     if BS.all (== 0) header
         then parseEOF
@@ -147,19 +149,19 @@ tarArchive () = fix $ \loop -> do
   where
     parseHeader header loop =
         case decode header of
-            Left _ -> Pipes.liftP . Either.left . toException $
+            Left _ -> lift . lift . Either.left . toException $
                 InvalidHeader header
             Right e -> do
-                Parse.zoom bytesRead $ State.put (Sum 0)
+                Parse.zoom bytesRead $ lift $ State.put (Sum 0)
                 Pipes.respond e
-                Sum consumed <- State.gets (getConst . bytesRead Const)
-                Parse.zoom pushBack $ skipBytes (tarBlocks e - consumed)
+                Sum consumed <- lift $ State.gets (getConst . bytesRead Const)
+                Parse.zoom pushBack $ skipBytesUpTo (tarBlocks e - consumed)
                 loop
 
     parseEOF = do
-        part2 <- Parse.zoom pushBack $ drawBytes 512
+        part2 <- Parse.zoom pushBack $ drawBytesUpTo 512
         when (BS.all (/= 0) part2) $
-            Pipes.liftP . Either.left . toException $ InvalidEOF
+            lift . lift . Either.left . toException $ InvalidEOF
 
     tarBlocks entry = (((entrySize entry - 1) `div` 512) + 1) * 512
 
@@ -170,7 +172,7 @@ tarArchive () = fix $ \loop -> do
 -- you nest this call inside the 'Pipes.Proxy' downstream of 'tarArchive'.
 -- For example:
 --
--- > tarArchive />/ (\e -> tarEntry e >-> writeFile (entryName e))
+-- > tarArchive />/ (\e -> (tarEntry e >-> writeFile (entryName e)) ())
 --
 -- This example uses respond composition ('Pipes./>/') to join in the tar
 -- entry handler, introduced with @\e@. This allows you to perform some logic on
@@ -183,9 +185,9 @@ tarArchive () = fix $ \loop -> do
 -- type check, but the contents streamed will be the latest tar entry - not the
 -- one passed in! If you use respond composition ('Pipes./>/') you should never
 -- encounter this problem.
-tarEntry :: (Monad m, Pipes.Proxy p)
+tarEntry :: Monad m
     => TarEntry
-    -> () -> Pipes.Pipe (TarP p) (Maybe BS.ByteString) BS.ByteString m ()
+    -> () -> Pipes.Pipe (Maybe BS.ByteString) BS.ByteString (TarT m) ()
 tarEntry entry () = case entryType entry of
     File -> loop (entrySize entry)
     _ -> return ()
@@ -197,40 +199,36 @@ tarEntry entry () = case entryType entry of
             if len <= remainder
                 then do
                     Parse.zoom bytesRead $ do
-                        Sum n <- State.get
-                        State.put $! Sum (n + len)
+                        Sum n <- lift State.get
+                        lift . State.put $! Sum (n + len)
                     Pipes.respond bs
                     loop (remainder - len)
                 else do
                     let (prefix, suffix) = BS.splitAt remainder bs
                     Parse.zoom pushBack $ Parse.unDraw suffix
-                    Parse.zoom bytesRead $ State.put (Sum (entrySize entry))
+                    Parse.zoom bytesRead $
+                      lift $ State.put (Sum (entrySize entry))
                     Pipes.respond prefix
 
 
 --------------------------------------------------------------------------------
--- | The 'TarP' 'Pipes.Proxy' transformer is simply 'State.StateP' with
--- 'TarParseState' as state.
-type TarP p = State.StateP TarParseState (Either.EitherP SomeException p)
+-- | The 'TarT' monad transformer is  'State.StateT' with
+-- 'TarParseState' as state, and the possibility of errors via 'SomeException'
+type TarT m = State.StateT TarParseState (Either.EitherT SomeException m)
 
 
 -- | Run a 'TarP' 'Pipes.Proxy'.
-runTarK :: (Monad m, Pipes.Proxy p) =>
-    (b' -> TarP p a' a b' b m r) -> b' -> p a' a b' b m (Either SomeException r)
-runTarK = Either.runEitherK . State.evalStateK mempty
-
-
---------------------------------------------------------------------------------
-drawBytes :: (Monad m, Pipes.Proxy p) =>
-    Int -> State.StateP [BS.ByteString] p
-            () (Maybe BS.ByteString) y' y m BS.ByteString
-drawBytes n = (passBytesUpTo n >-> const go) ()
+runTarP :: Monad m =>
+    Pipes.Proxy a' a b' b (TarT m) r ->
+    Pipes.Proxy a' a b' b m (Either SomeException r)
+runTarP = runEitherP . Pipes.evalStateP mempty
   where
-    go = Pipes.request () >>= maybe (return mempty) (\x -> BS.append x <$> go)
-
-
---------------------------------------------------------------------------------
-skipBytes :: (Monad m, Pipes.Proxy p) =>
-    Int -> State.StateP [BS.ByteString] p () (Maybe BS.ByteString) y' y m ()
-skipBytes n = (passBytesUpTo n >-> const go) ()
-  where go = Pipes.request () >>= maybe (return ()) (const go)
+    runEitherP p = case p of
+        PI.Request a' fa -> PI.Request a' (\a -> runEitherP (fa a ))
+        PI.Respond b fb' -> PI.Respond b (\b' -> runEitherP (fb' b'))
+        PI.Pure r -> PI.Pure (Right r)
+        PI.M m -> PI.M (do
+            x <- Either.runEitherT m
+            return (case x of
+                Left e -> PI.Pure (Left e)
+                Right p' -> runEitherP p' ) )
