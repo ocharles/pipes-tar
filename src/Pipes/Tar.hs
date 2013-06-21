@@ -5,6 +5,10 @@ module Pipes.Tar
     , readCurrentEntry
     , TarEntry(..)
 
+      -- * Writing archives
+    , writeTar
+    , writeTarEntry
+
       -- * TarT transformer
     , TarParseState
     , TarT
@@ -19,6 +23,7 @@ import Control.Exception
 import Control.Monad (forever, msum, mzero, when)
 import Control.Monad.Morph (hoist)
 import Control.Monad.Trans.Class (lift)
+import Data.Digits (digits, digitsRev, unDigits)
 import Data.Function (fix)
 import Data.Foldable (forM_)
 import Data.Monoid ((<>), Monoid(..), Sum(..))
@@ -34,6 +39,7 @@ import System.Posix.Types (CMode(..), FileMode)
 
 
 --------------------------------------------------------------------------------
+import qualified Data.Serialize.Put as Put
 import qualified Pipes
 import qualified Pipes.Prelude as Pipes
 import qualified Pipes.Lift as Pipes
@@ -130,7 +136,30 @@ instance Serialize TarEntry where
 
         parseASCII n = Char8.unpack . BS.takeWhile (/= 0) <$> Get.getBytes n
 
-    put = error "TarEntry serialization is not implemented"
+    -----------------------------------------------------------------------------
+    put e = do
+        let truncated = take 100 (entryPath e)
+        Put.putByteString (Char8.pack truncated)
+        Put.putByteString (BS.replicate (100 - length truncated) 0)
+        writeOctal 7 0
+        writeOctal 7 0
+        writeOctal 7 0
+        writeOctal 11 (entrySize e)
+        writeOctal 11 0
+        Put.putByteString (BS.replicate 8 0)
+        Put.putWord8 0
+        Put.putByteString (BS.replicate 100 0)
+        Put.putByteString (BS.replicate 255 0)
+
+      where
+
+        writeOctal n =
+            Put.putByteString . Char8.pack . zeroPad .
+                reverse . ('\000' :) .  map toEnum . digitsRev 8
+
+          where
+
+            zeroPad l = (replicate (max 0 $ n - length l) '0' ++ l)
 
 
 --------------------------------------------------------------------------------
@@ -213,6 +242,54 @@ readCurrentEntry () = do
                     Parse.zoom bytesRead $
                       lift $ State.put (Sum (entrySize entry))
                     Pipes.respond prefix
+
+
+--------------------------------------------------------------------------------
+data CompleteEntry = CompleteEntry (Int -> TarEntry) BS.ByteString
+
+
+--------------------------------------------------------------------------------
+writeTarEntry
+    :: Monad m
+    => UTCTime -> () -> Pipes.Pipe (Maybe BS.ByteString) CompleteEntry m ()
+writeTarEntry t () = do
+    content <- mconcat <$> requestAll
+    let headerBuilder = \size ->
+            TarEntry { entryPath = "My little test path"
+                     , entrySize = size
+                     , entryMode = 0
+                     , entryUID = 0
+                     , entryGID = 0
+                     , entryLastModified = t
+                     , entryType = File
+                     , entryLinkName = ""
+                     }
+
+    Pipes.respond (CompleteEntry headerBuilder content)
+
+  where
+
+    requestAll = go id
+      where
+        go diffAs = do
+            ma <- Pipes.request ()
+            case ma of
+                Nothing -> return (diffAs [])
+                Just a -> go (diffAs . (a:))
+
+
+--------------------------------------------------------------------------------
+writeTar :: Monad m => () -> Pipes.Pipe (Maybe CompleteEntry) BS.ByteString m ()
+writeTar () = fix $ \next -> do
+    entry <- Pipes.request ()
+    case entry of
+        Nothing -> Pipes.respond (BS.replicate 1024 0)
+        Just (CompleteEntry headerBuilder content) -> do
+            let fileSize = BS.length content
+            Pipes.respond (encode $ headerBuilder fileSize)
+            Pipes.respond content
+            Pipes.respond (BS.replicate (512 - fileSize `mod` 512) 0)
+            next
 
 
 --------------------------------------------------------------------------------
