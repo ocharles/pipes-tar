@@ -1,10 +1,12 @@
 {-# LANGUAGE DeriveDataTypeable #-}
 module Pipes.Tar
-    ( tarArchive
-    , tarEntry
+    ( -- * Reading archives
+      readTar
+    , readCurrentEntry
     , TarEntry(..)
-    , TarParseState
 
+      -- * TarT transformer
+    , TarParseState
     , TarT
     , runTarP
 
@@ -14,23 +16,26 @@ module Pipes.Tar
 --------------------------------------------------------------------------------
 import Control.Applicative
 import Control.Exception
-import Control.Monad (msum, mzero, when)
+import Control.Monad (forever, msum, mzero, when)
+import Control.Monad.Morph (hoist)
 import Control.Monad.Trans.Class (lift)
-import Pipes.ByteString (drawBytesUpTo, skipBytesUpTo)
 import Data.Function (fix)
 import Data.Foldable (forM_)
 import Data.Monoid ((<>), Monoid(..), Sum(..))
-import Data.Serialize (Serialize(..), decode)
+import Data.Serialize (Serialize(..), decode, encode)
 import Data.Serialize.Get ()
 import Data.Time (UTCTime)
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 import Data.Typeable (Typeable)
 import Data.Word ()
+import Pipes ((>->))
+import Pipes.ByteString (drawBytesUpTo, skipBytesUpTo)
 import System.Posix.Types (CMode(..), FileMode)
 
 
 --------------------------------------------------------------------------------
 import qualified Pipes
+import qualified Pipes.Prelude as Pipes
 import qualified Pipes.Lift as Pipes
 import qualified Pipes.Internal as PI
 import qualified Control.Monad.Trans.Either as Either
@@ -44,25 +49,27 @@ import qualified Data.Serialize.Get as Get
 
 --------------------------------------------------------------------------------
 -- | 'TarParseState' is internal state that keeps track of how much of a file
--- has been read.
-data TarParseState = TarParseState [BS.ByteString] (Sum Int)
+-- has been read, along with other parts of book keeping.
+data TarParseState = TarParseState [BS.ByteString] (Sum Int) (Maybe TarEntry)
   deriving (Eq, Show)
 
-instance Monoid TarParseState where
-    mappend (TarParseState pbA brA) (TarParseState pbB brB) =
-        TarParseState (pbA <> pbB) (brA <> brB)
-    mempty = TarParseState mempty mempty
-
 -- Lens into push-back buffer
-pushBack :: Functor f => ([BS.ByteString] -> f [BS.ByteString])
-                      -> TarParseState -> f TarParseState
-pushBack f (TarParseState pb s) = fmap (\x -> TarParseState x s) (f pb)
+pushBack
+    :: Functor f
+    => ([BS.ByteString] -> f [BS.ByteString]) -> TarParseState -> f TarParseState
+pushBack f (TarParseState pb s e) = (\x -> TarParseState x s e) <$> (f pb)
 
 -- Lens into the amount of bytes read
-bytesRead :: Functor f => (Sum Int -> f (Sum Int))
-                       -> TarParseState -> f TarParseState
-bytesRead f (TarParseState pb s) = fmap (\x -> TarParseState pb x) (f s)
+bytesRead
+    :: Functor f
+    => (Sum Int -> f (Sum Int)) -> TarParseState -> f TarParseState
+bytesRead f (TarParseState pb s e) = (\x -> TarParseState pb x e) <$> (f s)
 
+-- Lens into the current 'TarEntry' being processed
+currentTarEntry
+    :: Functor f
+    => (Maybe TarEntry -> f (Maybe TarEntry)) -> TarParseState -> f TarParseState
+currentTarEntry f (TarParseState pb s e) = (\x -> TarParseState pb s x) <$> (f e)
 
 --------------------------------------------------------------------------------
 -- | Possible errors that can occur when reading tar files
@@ -128,18 +135,18 @@ instance Serialize TarEntry where
 
 --------------------------------------------------------------------------------
 -- | Transform a 'BS.ByteString' into a stream of 'TarEntry's. Each 'TarEntry'
--- can be expanded into its respective 'BS.ByteString' using 'tarEntry'. Parsing
+-- can be expanded into its respective 'BS.ByteString' using 'readTar'. Parsing
 -- tar archives can fail, so you may wish to use the @pipes-safe@ library, which
 -- is compatible with 'Pipes.Proxy'.
 --
--- Users should note that when 'tarArchive' is combined with 'tarEntry' using
--- 'Pipes./>/' (for example, 'tarArchive' 'Pipes./>/' 'flip' 'tarEntry' @()),
--- then 'tarArchive' will have control of terminating the entire 'Proxy' and
+-- Users should note that when 'readTar' is combined with 'readTar' using
+-- 'Pipes./>/' (for example, 'readTar' 'Pipes./>/' 'flip' 'readTar' @()),
+-- then 'readTar' will have control of terminating the entire 'Proxy' and
 -- *not* the down-stream handler. This means that the entire archive will always
 -- be streamed, whether or not you consume all files.
-tarArchive :: Monad m
+readTar :: Monad m
     => () -> Pipes.Pipe (Maybe BS.ByteString) TarEntry (TarT m) ()
-tarArchive () = fix $ \loop -> do
+readTar () = fix $ \loop -> do
     header <- Parse.zoom pushBack $ drawBytesUpTo 512
 
     if BS.all (== 0) header
@@ -153,6 +160,7 @@ tarArchive () = fix $ \loop -> do
                 InvalidHeader header
             Right e -> do
                 Parse.zoom bytesRead $ lift $ State.put (Sum 0)
+                Parse.zoom currentTarEntry $ lift $ State.put (Just e)
                 Pipes.respond e
                 Sum consumed <- lift $ State.gets (getConst . bytesRead Const)
                 Parse.zoom pushBack $ skipBytesUpTo (tarBlocks e - consumed)
@@ -168,31 +176,27 @@ tarArchive () = fix $ \loop -> do
 
 
 --------------------------------------------------------------------------------
--- | Expand a 'TarEntry' into a 'BS.ByteString'. The intended usage here is
--- you nest this call inside the 'Pipes.Proxy' downstream of 'tarArchive'.
+-- | Expand the current 'TarEntry' into a 'BS.ByteString'. The intended usage
+-- here is you nest this call inside the 'Pipes.Proxy' downstream of 'readTar'.
+--
 -- For example:
 --
--- > tarArchive />/ (\e -> (tarEntry e >-> writeFile (entryName e)) ())
+-- > readTar />/ (\e -> (readCurrentEntry >-> writeFile (entryName e)) ())
 --
 -- This example uses respond composition ('Pipes./>/') to join in the tar
 -- entry handler, introduced with @\e@. This allows you to perform some logic on
 -- each 'TarEntry' - deciding how/whether you want to process each entry.
---
--- There is one caveat with 'tarEntry', which is: you can only stream the last
--- value produced by 'tarArchive'. So if you were to use pull composition and
--- 'Pipes.request'ed multiple 'TarEntry's - you can only call 'tarEntry' on the
--- latest 'TarEntry' that upstream responds with. Use of other 'tarEntry's will
--- type check, but the contents streamed will be the latest tar entry - not the
--- one passed in! If you use respond composition ('Pipes./>/') you should never
--- encounter this problem.
-tarEntry :: Monad m
-    => TarEntry
-    -> () -> Pipes.Pipe (Maybe BS.ByteString) BS.ByteString (TarT m) ()
-tarEntry entry () = case entryType entry of
-    File -> loop (entrySize entry)
-    _ -> return ()
+readCurrentEntry
+    :: Monad m
+    => () -> Pipes.Pipe (Maybe BS.ByteString) BS.ByteString (TarT m) ()
+readCurrentEntry () = do
+    e <- Parse.zoom currentTarEntry $ lift $ State.get
+    forM_ e $ \entry -> do
+        case entryType entry of
+            File -> loop entry (entrySize entry)
+            _ -> return ()
   where
-    loop remainder = when (remainder > 0) $ do
+    loop entry remainder = when (remainder > 0) $ do
         mbs <- Parse.zoom pushBack Parse.draw
         forM_ mbs $ \bs -> do
             let len = BS.length bs
@@ -202,7 +206,7 @@ tarEntry entry () = case entryType entry of
                         Sum n <- lift State.get
                         lift . State.put $! Sum (n + len)
                     Pipes.respond bs
-                    loop (remainder - len)
+                    loop entry (remainder - len)
                 else do
                     let (prefix, suffix) = BS.splitAt remainder bs
                     Parse.zoom pushBack $ Parse.unDraw suffix
@@ -221,8 +225,9 @@ type TarT m = State.StateT TarParseState (Either.EitherT SomeException m)
 runTarP :: Monad m =>
     Pipes.Proxy a' a b' b (TarT m) r ->
     Pipes.Proxy a' a b' b m (Either SomeException r)
-runTarP = runEitherP . Pipes.evalStateP mempty
+runTarP = runEitherP . Pipes.evalStateP startingState
   where
+    startingState = TarParseState [] (Sum 0) Nothing
     runEitherP p = case p of
         PI.Request a' fa -> PI.Request a' (\a -> runEitherP (fa a ))
         PI.Respond b fb' -> PI.Respond b (\b' -> runEitherP (fb' b'))

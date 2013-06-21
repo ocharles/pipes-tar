@@ -24,6 +24,7 @@ library
     bytestring >= 0.9,
     cereal >= 0.3,
     bytestring-lexing >= 0.4.0,
+    mmorph,
     pipes-parse >= 1.0.0,
     time >= 1.4,
     transformers,
