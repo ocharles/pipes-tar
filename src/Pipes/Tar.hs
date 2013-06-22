@@ -20,37 +20,35 @@ module Pipes.Tar
 --------------------------------------------------------------------------------
 import Control.Applicative
 import Control.Exception
-import Control.Monad (forever, msum, mzero, when)
-import Control.Monad.Morph (hoist)
+import Control.Monad (msum, mzero, when)
 import Control.Monad.Trans.Class (lift)
-import Data.Digits (digits, digitsRev, unDigits)
-import Data.Function (fix)
+import Data.Char (digitToInt, intToDigit)
+import Data.Digits (digitsRev, unDigits)
 import Data.Foldable (forM_)
-import Data.Monoid ((<>), Monoid(..), Sum(..))
-import Data.Serialize (Serialize(..), decode, encode)
+import Data.Function (fix)
+import Data.Monoid (Monoid(..), Sum(..))
 import Data.Serialize.Get ()
+import Data.Serialize (Serialize(..), decode, encode)
+import Data.Time.Clock.POSIX (posixSecondsToUTCTime, utcTimeToPOSIXSeconds)
 import Data.Time (UTCTime)
-import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 import Data.Typeable (Typeable)
 import Data.Word ()
-import Pipes ((>->))
 import Pipes.ByteString (drawBytesUpTo, skipBytesUpTo)
 import System.Posix.Types (CMode(..), FileMode)
 
 
 --------------------------------------------------------------------------------
-import qualified Data.Serialize.Put as Put
-import qualified Pipes
-import qualified Pipes.Prelude as Pipes
-import qualified Pipes.Lift as Pipes
-import qualified Pipes.Internal as PI
 import qualified Control.Monad.Trans.Either as Either
 import qualified Control.Monad.Trans.State.Strict as State
-import qualified Pipes.Parse as Parse
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as Char8
 import qualified Data.ByteString.Lex.Integral as Lexing
 import qualified Data.Serialize.Get as Get
+import qualified Data.Serialize.Put as Put
+import qualified Pipes
+import qualified Pipes.Internal as PI
+import qualified Pipes.Lift as Pipes
+import qualified Pipes.Parse as Parse
 
 
 --------------------------------------------------------------------------------
@@ -109,7 +107,7 @@ data EntryType = File | Directory
 --------------------------------------------------------------------------------
 instance Serialize TarEntry where
     get = TarEntry <$> parseASCII 100
-                   <*> fmap (CMode . fromIntegral) (readOctal 7) <* Get.skip 1
+                   <*> fmap fromIntegral (readOctal 7) <* Get.skip 1
                    <*> readOctal 7 <* Get.skip 1
                    <*> readOctal 7 <* Get.skip 1
                    <*> readOctal 12
@@ -141,13 +139,16 @@ instance Serialize TarEntry where
         let truncated = take 100 (entryPath e)
         Put.putByteString (Char8.pack truncated)
         Put.putByteString (BS.replicate (100 - length truncated) 0)
-        writeOctal 7 0
-        writeOctal 7 0
-        writeOctal 7 0
+        writeOctal 7 (case entryMode e of CMode m -> m)
+        writeOctal 7 (entryUID e)
+        writeOctal 7 (entryGID e)
         writeOctal 11 (entrySize e)
-        writeOctal 11 0
+        writeOctal 11 . toInteger . round . utcTimeToPOSIXSeconds $
+            entryLastModified e
         Put.putByteString (BS.replicate 8 0)
-        Put.putWord8 0
+        put $ case entryType e of
+            File -> '0'
+            Directory -> '5'
         Put.putByteString (BS.replicate 100 0)
         Put.putByteString (BS.replicate 255 0)
 
@@ -155,11 +156,11 @@ instance Serialize TarEntry where
 
         writeOctal n =
             Put.putByteString . Char8.pack . zeroPad .
-                reverse . ('\000' :) .  map toEnum . digitsRev 8
+                reverse . ('\000' :) .  map (intToDigit . fromIntegral) . digitsRev 8
 
           where
 
-            zeroPad l = (replicate (max 0 $ n - length l) '0' ++ l)
+            zeroPad l = (replicate (max 0 $ n - length l + 1) '0' ++ l)
 
 
 --------------------------------------------------------------------------------
