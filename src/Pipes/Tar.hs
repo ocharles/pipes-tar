@@ -4,6 +4,7 @@ module Pipes.Tar
       readTar
     , readCurrentEntry
     , TarEntry(..)
+    , TarReader
 
       -- * Writing archives
     , writeTar
@@ -16,6 +17,7 @@ module Pipes.Tar
 
     , TarException(..)
     ) where
+
 
 --------------------------------------------------------------------------------
 import Control.Applicative
@@ -50,30 +52,32 @@ import qualified Pipes.Internal as PI
 import qualified Pipes.Lift as Pipes
 import qualified Pipes.Parse as Parse
 
-
 --------------------------------------------------------------------------------
 -- | 'TarParseState' is internal state that keeps track of how much of a file
 -- has been read, along with other parts of book keeping.
-data TarParseState = TarParseState [BS.ByteString] (Sum Int) (Maybe TarEntry)
+data TarParseState = TarParseState [BS.ByteString] (Maybe TarEntry)
   deriving (Eq, Show)
 
 -- Lens into push-back buffer
 pushBack
     :: Functor f
     => ([BS.ByteString] -> f [BS.ByteString]) -> TarParseState -> f TarParseState
-pushBack f (TarParseState pb s e) = (\x -> TarParseState x s e) <$> (f pb)
-
--- Lens into the amount of bytes read
-bytesRead
-    :: Functor f
-    => (Sum Int -> f (Sum Int)) -> TarParseState -> f TarParseState
-bytesRead f (TarParseState pb s e) = (\x -> TarParseState pb x e) <$> (f s)
+pushBack f (TarParseState pb e) = (\x -> TarParseState x e) <$> (f pb)
 
 -- Lens into the current 'TarEntry' being processed
 currentTarEntry
     :: Functor f
     => (Maybe TarEntry -> f (Maybe TarEntry)) -> TarParseState -> f TarParseState
-currentTarEntry f (TarParseState pb s e) = (\x -> TarParseState pb s x) <$> (f e)
+currentTarEntry f (TarParseState pb e) = (\x -> TarParseState pb x) <$> (f e)
+
+
+--------------------------------------------------------------------------------
+-- | The 'TarReader' type is a token that allows a 'Pipes.Proxy' to be composed
+-- with 'readTar'. The only thing producing these tokens is 'readCurrentEntry',
+-- thus the only thing that can be immediately composed with 'readTar' is
+-- 'readCurrentEntry'.
+newtype TarReader = TarR ()
+
 
 --------------------------------------------------------------------------------
 -- | Possible errors that can occur when reading tar files
@@ -85,6 +89,7 @@ data TarException
   deriving (Show, Typeable)
 
 instance Exception TarException
+
 
 --------------------------------------------------------------------------------
 -- | A 'TarEntry' contains all the metadata about a single entry in a tar file.
@@ -175,7 +180,7 @@ instance Serialize TarEntry where
 -- *not* the down-stream handler. This means that the entire archive will always
 -- be streamed, whether or not you consume all files.
 readTar :: Monad m
-    => () -> Pipes.Pipe (Maybe BS.ByteString) TarEntry (TarT m) ()
+    => () -> Pipes.Proxy () (Maybe BS.ByteString) TarReader TarEntry (TarT m) ()
 readTar () = fix $ \loop -> do
     header <- Parse.zoom pushBack $ drawBytesUpTo 512
 
@@ -189,11 +194,8 @@ readTar () = fix $ \loop -> do
             Left _ -> lift . lift . Either.left . toException $
                 InvalidHeader header
             Right e -> do
-                Parse.zoom bytesRead $ lift $ State.put (Sum 0)
                 Parse.zoom currentTarEntry $ lift $ State.put (Just e)
                 Pipes.respond e
-                Sum consumed <- lift $ State.gets (getConst . bytesRead Const)
-                Parse.zoom pushBack $ skipBytesUpTo (tarBlocks e - consumed)
                 loop
 
     parseEOF = do
@@ -202,7 +204,6 @@ readTar () = fix $ \loop -> do
             lift . lift . Either.left . toException $ InvalidEOF
 
     tarBlocks entry = (((entrySize entry - 1) `div` 512) + 1) * 512
-
 
 
 --------------------------------------------------------------------------------
@@ -218,13 +219,16 @@ readTar () = fix $ \loop -> do
 -- each 'TarEntry' - deciding how/whether you want to process each entry.
 readCurrentEntry
     :: Monad m
-    => () -> Pipes.Pipe (Maybe BS.ByteString) BS.ByteString (TarT m) ()
+    => () -> Pipes.Proxy () (Maybe BS.ByteString) () BS.ByteString
+                 (TarT m) TarReader
 readCurrentEntry () = do
     e <- Parse.zoom currentTarEntry $ lift $ State.get
     forM_ e $ \entry -> do
         case entryType entry of
             File -> loop entry (entrySize entry)
             _ -> return ()
+
+    return $ TarR ()
   where
     loop entry remainder = when (remainder > 0) $ do
         mbs <- Parse.zoom pushBack Parse.draw
@@ -232,16 +236,11 @@ readCurrentEntry () = do
             let len = BS.length bs
             if len <= remainder
                 then do
-                    Parse.zoom bytesRead $ do
-                        Sum n <- lift State.get
-                        lift . State.put $! Sum (n + len)
                     Pipes.respond bs
                     loop entry (remainder - len)
                 else do
                     let (prefix, suffix) = BS.splitAt remainder bs
                     Parse.zoom pushBack $ Parse.unDraw suffix
-                    Parse.zoom bytesRead $
-                      lift $ State.put (Sum (entrySize entry))
                     Pipes.respond prefix
 
 
@@ -305,7 +304,7 @@ runTarP :: Monad m =>
     Pipes.Proxy a' a b' b m (Either SomeException r)
 runTarP = runEitherP . Pipes.evalStateP startingState
   where
-    startingState = TarParseState [] (Sum 0) Nothing
+    startingState = TarParseState [] Nothing
     runEitherP p = case p of
         PI.Request a' fa -> PI.Request a' (\a -> runEitherP (fa a ))
         PI.Respond b fb' -> PI.Respond b (\b' -> runEitherP (fb' b'))
