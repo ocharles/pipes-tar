@@ -225,7 +225,10 @@ readCurrentEntry () = do
     e <- Parse.zoom currentTarEntry $ lift $ State.get
     forM_ e $ \entry -> do
         case entryType entry of
-            File -> loop entry (entrySize entry)
+            File -> do
+                loop entry (entrySize entry)
+                Parse.zoom pushBack $
+                    skipBytesUpTo (512 - entrySize entry `mod` 512)
             _ -> return ()
 
     return $ TarR ()
