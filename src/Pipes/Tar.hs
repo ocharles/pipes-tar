@@ -24,11 +24,11 @@ import Control.Applicative
 import Control.Exception
 import Control.Monad (msum, mzero, when)
 import Control.Monad.Trans.Class (lift)
-import Data.Char (digitToInt, intToDigit)
-import Data.Digits (digitsRev, unDigits)
+import Data.Char (intToDigit)
+import Data.Digits (digitsRev)
 import Data.Foldable (forM_)
 import Data.Function (fix)
-import Data.Monoid (Monoid(..), Sum(..))
+import Data.Monoid (Monoid(..))
 import Data.Serialize.Get ()
 import Data.Serialize (Serialize(..), decode, encode)
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime, utcTimeToPOSIXSeconds)
@@ -165,7 +165,7 @@ instance Serialize TarEntry where
 
           where
 
-            zeroPad l = (replicate (max 0 $ n - length l + 1) '0' ++ l)
+            zeroPad l = replicate (max 0 $ n - length l + 1) '0' ++ l
 
 
 --------------------------------------------------------------------------------
@@ -203,8 +203,6 @@ readTar () = fix $ \loop -> do
         when (BS.all (/= 0) part2) $
             lift . lift . Either.left . toException $ InvalidEOF
 
-    tarBlocks entry = (((entrySize entry - 1) `div` 512) + 1) * 512
-
 
 --------------------------------------------------------------------------------
 -- | Expand the current 'TarEntry' into a 'BS.ByteString'. The intended usage
@@ -222,8 +220,8 @@ readCurrentEntry
     => () -> Pipes.Proxy () (Maybe BS.ByteString) () BS.ByteString
                  (TarT m) TarReader
 readCurrentEntry () = do
-    e <- Parse.zoom currentTarEntry $ lift $ State.get
-    forM_ e $ \entry -> do
+    e <- Parse.zoom currentTarEntry $ lift State.get
+    forM_ e $ \entry ->
         case entryType entry of
             File -> do
                 loop entry (entrySize entry)
@@ -257,7 +255,7 @@ writeTarEntry
     => UTCTime -> () -> Pipes.Pipe (Maybe BS.ByteString) CompleteEntry m ()
 writeTarEntry t () = do
     content <- mconcat <$> requestAll
-    let headerBuilder = \size ->
+    let headerBuilder size =
             TarEntry { entryPath = "My little test path"
                      , entrySize = size
                      , entryMode = 0
