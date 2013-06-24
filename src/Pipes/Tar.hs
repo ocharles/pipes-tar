@@ -23,15 +23,13 @@ module Pipes.Tar
 --------------------------------------------------------------------------------
 import Control.Applicative
 import Control.Exception
-import Control.Monad (msum, mzero, unless, when)
+import Control.Monad (guard, msum, mzero, unless, when)
 import Control.Monad.Trans.Class (lift)
 import Data.Char (intToDigit)
 import Data.Digits (digitsRev)
 import Data.Foldable (forM_)
 import Data.Function (fix)
 import Data.Monoid (Monoid(..), (<>))
-import Data.Serialize.Get ()
-import Data.Serialize (Serialize(..), decode, encode)
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime, utcTimeToPOSIXSeconds)
 import Data.Time (UTCTime)
 import Data.Typeable (Typeable)
@@ -47,7 +45,6 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as Char8
 import qualified Data.ByteString.Lex.Integral as Lexing
 import qualified Data.Serialize.Get as Get
-import qualified Data.Serialize.Put as Put
 import qualified Pipes
 import qualified Pipes.Internal as PI
 import qualified Pipes.Lift as Pipes
@@ -112,64 +109,76 @@ data EntryType = File | Directory
 
 
 --------------------------------------------------------------------------------
-instance Serialize TarEntry where
-    get = TarEntry <$> parseASCII 100
-                   <*> fmap fromIntegral (readOctal 7) <* Get.skip 1
-                   <*> readOctal 7 <* Get.skip 1
-                   <*> readOctal 7 <* Get.skip 1
-                   <*> readOctal 12
-                   <*> (posixSecondsToUTCTime . fromIntegral <$> readOctal 11)
-                   <* Get.skip 9
-                   <*> (Get.getWord8 >>= parseType . toEnum . fromIntegral)
-                   <*> parseASCII 100
-                   <*  Get.getBytes 255
-      where
-        readOctal n =
-            Get.getBytes n >>= \x ->
-                msum [ maybe mzero (return . fst) . Lexing.readOctal $ BS.take 11 x
-                     , return (readBase256 x)
-                     ]
+decodeTar :: BS.ByteString -> Either String TarEntry
+decodeTar header = flip Get.runGet header $
+    TarEntry <$> parseASCII 100
+             <*> fmap fromIntegral (readOctal 7) <* Get.skip 1
+             <*> readOctal 7 <* Get.skip 1
+             <*> readOctal 7 <* Get.skip 1
+             <*> readOctal 12
+             <*> (posixSecondsToUTCTime . fromIntegral <$> readOctal 11)
+             <*  (do Get.skip 1
+                     readOctal 6 >>= guard . (== expectedChecksum)
+                     Get.skip 2)
+             <*> (Get.getWord8 >>= parseType . toEnum . fromIntegral)
+             <*> parseASCII 100
+             <*  Get.getBytes 255
 
-        readBase256 :: BS.ByteString -> Int
-        readBase256 = foldl (\acc x -> acc * 256 + fromIntegral x) 0 .
-          BS.unpack . BS.drop 1
+  where
 
-        parseType '\0' = return File
-        parseType '0' = return File
-        parseType '5' = return Directory
-        parseType x = error . show $ x
+    readOctal n =
+        Get.getBytes n >>= \x ->
+            msum [ maybe mzero (return . fst) . Lexing.readOctal $ BS.take n x
+                 , return (readBase256 x)
+                 ]
 
-        parseASCII n = Char8.unpack . BS.takeWhile (/= 0) <$> Get.getBytes n
+    readBase256 :: BS.ByteString -> Int
+    readBase256 = foldl (\acc x -> acc * 256 + fromIntegral x) 0 .
+        BS.unpack . BS.drop 1
 
-    -----------------------------------------------------------------------------
-    put e =
-        let truncated = take 100 (entryPath e)
-            filePath = Char8.pack truncated <>
-                       BS.replicate (100 - length truncated) 0
-            mode = toOctal 7 $ case entryMode e of CMode m -> m
-            uid = toOctal 7 $ entryUID e
-            gid = toOctal 7 $ entryGID e
-            size = toOctal 11 (entrySize e)
-            modified = toOctal 11 . toInteger . round . utcTimeToPOSIXSeconds $
-                           entryLastModified e
-            eType = Char8.singleton $ case entryType e of
-                File -> '0'
-                Directory -> '5'
-            linkName = BS.replicate 100 0
-            checksum = toOctal 6 $ (sum :: [Int] -> Int) $ map fromIntegral $
-                concatMap BS.unpack
-                    [ filePath, mode, uid, gid, size, modified
-                    , Char8.replicate 8 ' '
-                    , eType, linkName
-                    ]
+    parseType '\0' = return File
+    parseType '0' = return File
+    parseType '5' = return Directory
+    parseType x = error . show $ x
 
-        in Put.putByteString $ mconcat
-            [ filePath, mode, uid, gid, size, modified
-            , checksum <> Char8.singleton ' '
-            , eType
-            , linkName
-            , BS.replicate 255 0
-            ]
+    parseASCII n = Char8.unpack . BS.takeWhile (/= 0) <$> Get.getBytes n
+
+    expectedChecksum =
+        let (left, rest) = BS.splitAt 148 header
+            right = BS.take 101 . snd . BS.splitAt 8 $ rest
+        in (sum :: [Int] -> Int) $ map fromIntegral $ concatMap BS.unpack
+            [ left, Char8.replicate 8 ' ', right ]
+
+
+--------------------------------------------------------------------------------
+encodeTar :: TarEntry -> BS.ByteString
+encodeTar e =
+    let truncated = take 100 (entryPath e)
+        filePath = Char8.pack truncated <>
+                   BS.replicate (100 - length truncated) 0
+        mode = toOctal 7 $ case entryMode e of CMode m -> m
+        uid = toOctal 7 $ entryUID e
+        gid = toOctal 7 $ entryGID e
+        size = toOctal 11 (entrySize e)
+        modified = toOctal 11 . toInteger . round . utcTimeToPOSIXSeconds $
+                       entryLastModified e
+        eType = Char8.singleton $ case entryType e of
+            File -> '0'
+            Directory -> '5'
+        linkName = BS.replicate 100 0
+        checksum = toOctal 6 $ (sum :: [Int] -> Int) $ map fromIntegral $
+            concatMap BS.unpack
+                [ filePath, mode, uid, gid, size, modified
+                , Char8.replicate 8 ' '
+                , eType, linkName
+                ]
+
+    in mconcat [ filePath, mode, uid, gid, size, modified
+               , checksum <> Char8.singleton ' '
+               , eType
+               , linkName
+               , BS.replicate 255 0
+               ]
 
       where
 
@@ -204,7 +213,7 @@ readTar () = fix $ \loop -> do
 
   where
     parseHeader header loop =
-        case decode header of
+        case decodeTar header of
             Left _ -> lift . lift . Either.left . toException $
                 InvalidHeader header
             Right e -> do
@@ -323,7 +332,7 @@ writeTar () = fix $ \next -> do
         Nothing -> Pipes.respond (BS.replicate 1024 0)
         Just (CompleteEntry header content) -> do
             let fileSize = entrySize header
-            Pipes.respond (encode header)
+            Pipes.respond (encodeTar header)
             Pipes.respond content
             unless (fileSize `mod` 512 == 0) $
                 Pipes.respond (BS.replicate (512 - fileSize `mod` 512) 0)
