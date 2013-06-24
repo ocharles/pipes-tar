@@ -8,7 +8,8 @@ module Pipes.Tar
 
       -- * Writing archives
     , writeTar
-    , writeTarEntry
+    , writeFileEntry
+    , writeDirectoryEntry
 
       -- * TarT transformer
     , TarParseState
@@ -22,13 +23,13 @@ module Pipes.Tar
 --------------------------------------------------------------------------------
 import Control.Applicative
 import Control.Exception
-import Control.Monad (msum, mzero, when)
+import Control.Monad (msum, mzero, unless, when)
 import Control.Monad.Trans.Class (lift)
 import Data.Char (intToDigit)
 import Data.Digits (digitsRev)
 import Data.Foldable (forM_)
 import Data.Function (fix)
-import Data.Monoid (Monoid(..))
+import Data.Monoid (Monoid(..), (<>))
 import Data.Serialize.Get ()
 import Data.Serialize (Serialize(..), decode, encode)
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime, utcTimeToPOSIXSeconds)
@@ -51,6 +52,7 @@ import qualified Pipes
 import qualified Pipes.Internal as PI
 import qualified Pipes.Lift as Pipes
 import qualified Pipes.Parse as Parse
+
 
 --------------------------------------------------------------------------------
 -- | 'TarParseState' is internal state that keeps track of how much of a file
@@ -140,27 +142,39 @@ instance Serialize TarEntry where
         parseASCII n = Char8.unpack . BS.takeWhile (/= 0) <$> Get.getBytes n
 
     -----------------------------------------------------------------------------
-    put e = do
+    put e =
         let truncated = take 100 (entryPath e)
-        Put.putByteString (Char8.pack truncated)
-        Put.putByteString (BS.replicate (100 - length truncated) 0)
-        writeOctal 7 (case entryMode e of CMode m -> m)
-        writeOctal 7 (entryUID e)
-        writeOctal 7 (entryGID e)
-        writeOctal 11 (entrySize e)
-        writeOctal 11 . toInteger . round . utcTimeToPOSIXSeconds $
-            entryLastModified e
-        Put.putByteString (BS.replicate 8 0)
-        put $ case entryType e of
-            File -> '0'
-            Directory -> '5'
-        Put.putByteString (BS.replicate 100 0)
-        Put.putByteString (BS.replicate 255 0)
+            filePath = Char8.pack truncated <>
+                       BS.replicate (100 - length truncated) 0
+            mode = toOctal 7 $ case entryMode e of CMode m -> m
+            uid = toOctal 7 $ entryUID e
+            gid = toOctal 7 $ entryGID e
+            size = toOctal 11 (entrySize e)
+            modified = toOctal 11 . toInteger . round . utcTimeToPOSIXSeconds $
+                           entryLastModified e
+            eType = Char8.singleton $ case entryType e of
+                File -> '0'
+                Directory -> '5'
+            linkName = BS.replicate 100 0
+            checksum = toOctal 6 $ (sum :: [Int] -> Int) $ map fromIntegral $
+                concatMap BS.unpack
+                    [ filePath, mode, uid, gid, size, modified
+                    , Char8.replicate 8 ' '
+                    , eType, linkName
+                    ]
+
+        in Put.putByteString $ mconcat
+            [ filePath, mode, uid, gid, size, modified
+            , checksum <> Char8.singleton ' '
+            , eType
+            , linkName
+            , BS.replicate 255 0
+            ]
 
       where
 
-        writeOctal n =
-            Put.putByteString . Char8.pack . zeroPad .
+        toOctal n =
+            Char8.pack . zeroPad .
                 reverse . ('\000' :) .  map (intToDigit . fromIntegral) . digitsRev 8
 
           where
@@ -246,27 +260,29 @@ readCurrentEntry () = do
 
 
 --------------------------------------------------------------------------------
-data CompleteEntry = CompleteEntry (Int -> TarEntry) BS.ByteString
+data CompleteEntry = CompleteEntry TarEntry BS.ByteString
+  deriving (Eq, Show)
 
 
 --------------------------------------------------------------------------------
-writeTarEntry
+writeFileEntry
     :: Monad m
-    => UTCTime -> () -> Pipes.Pipe (Maybe BS.ByteString) CompleteEntry m ()
-writeTarEntry t () = do
+    => FilePath -> FileMode -> Int -> Int -> UTCTime ->
+    () -> Pipes.Pipe (Maybe BS.ByteString) CompleteEntry m ()
+writeFileEntry path mode uid gid modified () = do
     content <- mconcat <$> requestAll
-    let headerBuilder size =
-            TarEntry { entryPath = "My little test path"
-                     , entrySize = size
-                     , entryMode = 0
-                     , entryUID = 0
-                     , entryGID = 0
-                     , entryLastModified = t
+    let header =
+            TarEntry { entryPath = path
+                     , entrySize = BS.length content
+                     , entryMode = mode
+                     , entryUID = uid
+                     , entryGID = gid
+                     , entryLastModified = modified
                      , entryType = File
                      , entryLinkName = ""
                      }
 
-    Pipes.respond (CompleteEntry headerBuilder content)
+    Pipes.respond (CompleteEntry header content)
 
   where
 
@@ -280,16 +296,37 @@ writeTarEntry t () = do
 
 
 --------------------------------------------------------------------------------
+writeDirectoryEntry
+    :: Monad m
+    => FilePath -> FileMode -> Int -> Int -> UTCTime
+    -> Pipes.Producer CompleteEntry m ()
+writeDirectoryEntry path mode uid gid modified = do
+    let header =
+            TarEntry { entryPath = path
+                     , entrySize = 0
+                     , entryMode = mode
+                     , entryUID = uid
+                     , entryGID = gid
+                     , entryLastModified = modified
+                     , entryType = Directory
+                     , entryLinkName = ""
+                     }
+
+    Pipes.respond (CompleteEntry header mempty)
+
+
+--------------------------------------------------------------------------------
 writeTar :: Monad m => () -> Pipes.Pipe (Maybe CompleteEntry) BS.ByteString m ()
 writeTar () = fix $ \next -> do
     entry <- Pipes.request ()
     case entry of
         Nothing -> Pipes.respond (BS.replicate 1024 0)
-        Just (CompleteEntry headerBuilder content) -> do
-            let fileSize = BS.length content
-            Pipes.respond (encode $ headerBuilder fileSize)
+        Just (CompleteEntry header content) -> do
+            let fileSize = entrySize header
+            Pipes.respond (encode header)
             Pipes.respond content
-            Pipes.respond (BS.replicate (512 - fileSize `mod` 512) 0)
+            unless (fileSize `mod` 512 == 0) $
+                Pipes.respond (BS.replicate (512 - fileSize `mod` 512) 0)
             next
 
 
