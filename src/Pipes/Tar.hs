@@ -145,7 +145,7 @@ decodeTar header = flip Get.runGet header $
 
     expectedChecksum =
         let (left, rest) = BS.splitAt 148 header
-            right = BS.take 101 . snd . BS.splitAt 8 $ rest
+            right = BS.drop 8 rest
         in (sum :: [Int] -> Int) $ map fromIntegral $ concatMap BS.unpack
             [ left, Char8.replicate 8 ' ', right ]
 
