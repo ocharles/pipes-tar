@@ -81,7 +81,7 @@ newtype TarReader = TarR ()
 -- | Possible errors that can occur when reading tar files
 data TarException
   = -- | The header for a tar entry could not be parsed
-    InvalidHeader BS.ByteString
+    InvalidHeader BS.ByteString String
   | -- | The EOF marker in the archive could not be parsed
     InvalidEOF
   deriving (Show, Typeable)
@@ -216,8 +216,8 @@ readTar () = fix $ \loop -> do
   where
     parseHeader header loop =
         case decodeTar header of
-            Left _ -> lift . lift . Either.left . toException $
-                InvalidHeader header
+            Left e -> lift . lift . Either.left . toException $
+                InvalidHeader header e
             Right e -> do
                 Parse.zoom currentTarEntry $ lift $ State.put (Just e)
                 Pipes.respond e
