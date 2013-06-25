@@ -118,26 +118,25 @@ decodeTar header = flip Get.runGet header $
              <*> (posixSecondsToUTCTime . fromIntegral <$> readOctal 12)
              <*  (do checksum <- Char8.takeWhile isDigit .
                                    Char8.dropWhile (== ' ') <$> Get.getBytes 8
-                     parseOctal checksum >>= guard . (== expectedChecksum))
+                     guard (parseOctal checksum == expectedChecksum))
              <*> (Get.getWord8 >>= parseType . toEnum . fromIntegral)
              <*> parseASCII 100
              <*  Get.getBytes 255
 
   where
 
-    readOctal n = Get.getBytes n >>= parseOctal
+    readOctal :: Int -> Get.Get Int
+    readOctal n = parseOctal <$> Get.getBytes n
 
-    parseOctal x =
-        msum [ return $ unDigits 8 . map digitToInt . Char8.unpack .
-                   Char8.dropWhile (== ' ') .
-                   BS.takeWhile (not . (`elem` [ fromIntegral $ ord ' ', 0 ])) $
-                     x
-             , return (readBase256 x)
-             ]
-
-    readBase256 :: BS.ByteString -> Int
-    readBase256 = foldl (\acc x -> acc * 256 + fromIntegral x) 0 .
-        BS.unpack . BS.drop 1
+    parseOctal :: BS.ByteString -> Int
+    parseOctal x
+        | BS.head x == 128 =
+            foldl (\acc x -> acc * 256 + fromIntegral x) 0 .
+                BS.unpack . BS.drop 1 $ x
+        | otherwise =
+            unDigits 8 . map digitToInt . Char8.unpack .
+                Char8.dropWhile (== ' ') .
+                BS.takeWhile (not . (`elem` [ fromIntegral $ ord ' ', 0 ])) $ x
 
     parseType '\0' = return File
     parseType '0' = return File
