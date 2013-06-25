@@ -25,7 +25,7 @@ import Control.Applicative
 import Control.Exception
 import Control.Monad (guard, msum, mzero, unless, when)
 import Control.Monad.Trans.Class (lift)
-import Data.Char (intToDigit)
+import Data.Char (intToDigit, isDigit, ord)
 import Data.Digits (digitsRev)
 import Data.Foldable (forM_)
 import Data.Function (fix)
@@ -112,25 +112,29 @@ data EntryType = File | Directory
 decodeTar :: BS.ByteString -> Either String TarEntry
 decodeTar header = flip Get.runGet header $
     TarEntry <$> parseASCII 100
-             <*> fmap fromIntegral (readOctal 7) <* Get.skip 1
-             <*> readOctal 7 <* Get.skip 1
-             <*> readOctal 7 <* Get.skip 1
+             <*> fmap fromIntegral (readOctal 8)
+             <*> readOctal 8
+             <*> readOctal 8
              <*> readOctal 12
-             <*> (posixSecondsToUTCTime . fromIntegral <$> readOctal 11)
-             <*  (do Get.skip 1
-                     readOctal 6 >>= guard . (== expectedChecksum)
-                     Get.skip 2)
+             <*> (posixSecondsToUTCTime . fromIntegral <$> readOctal 12)
+             <*  (do checksum <- Char8.takeWhile isDigit .
+                                   Char8.dropWhile (== ' ') <$> Get.getBytes 8
+                     parseOctal checksum >>= guard . (== expectedChecksum))
              <*> (Get.getWord8 >>= parseType . toEnum . fromIntegral)
              <*> parseASCII 100
              <*  Get.getBytes 255
 
   where
 
-    readOctal n =
-        Get.getBytes n >>= \x ->
-            msum [ maybe mzero (return . fst) . Lexing.readOctal $ BS.take n x
-                 , return (readBase256 x)
-                 ]
+    readOctal n = Get.getBytes n >>= parseOctal
+
+    parseOctal x =
+        msum [ maybe mzero (return . fst) . Lexing.readOctal .
+                   Char8.dropWhile (== ' ') .
+                   BS.takeWhile (not . (`elem` [ fromIntegral $ ord ' ', 0 ])) $
+                     x
+             , return (readBase256 x)
+             ]
 
     readBase256 :: BS.ByteString -> Int
     readBase256 = foldl (\acc x -> acc * 256 + fromIntegral x) 0 .
