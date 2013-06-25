@@ -1,29 +1,46 @@
 {-# LANGUAGE DeriveDataTypeable #-}
+{-|
+    @pipes-tar@ is a library for the @pipes@-ecosystem that provides the ability
+    to read from tar files in constant space, and write tar files using as much
+    memory as the largest file.
+-}
 module Pipes.Tar
-    ( -- * Reading archives
+    ( -- * Reading
+      -- $reading
+
+      -- * Writing
+      -- $writing
+
+      -- * API Reference
+      -- ** Reading
       readTar
     , readCurrentEntry
     , TarEntry(..)
-    , TarReader
+    , EntryType(..)
 
-      -- * Writing archives
+      -- ** Writing
     , writeTar
     , writeFileEntry
     , writeDirectoryEntry
+    , CompleteEntry
 
-      -- * TarT transformer
+      -- ** TarT transformer
     , TarParseState
     , TarT
     , runTarP
 
+      -- ** Exceptions
     , TarException(..)
+
+      -- ** Misc
+    , TarReader
     ) where
 
 
 --------------------------------------------------------------------------------
 import Control.Applicative
 import Control.Exception
-import Control.Monad (guard, msum, unless, when)
+import Control.Monad (guard, unless, when)
 import Control.Monad.Trans.Class (lift)
 import Data.Char (digitToInt, intToDigit, isDigit, ord)
 import Data.Digits (digitsRev, unDigits)
@@ -194,16 +211,78 @@ encodeTar e =
 
 
 --------------------------------------------------------------------------------
+{- $reading
+    tar files are read using two functions provided by @pipes-tar@ - 'readTar'
+    and 'readCurrentEntry'. In short, 'readTar' is used to read the format of a
+    tar file, turning a stream of bytes into a stream of 'TarEntry's, while
+    'readCurrentEntry' is used to stream the contents of the current file.
+
+    Here is an example of how to read a tar file, outputting just the names of
+    all entries in the archive:
+
+    > import Pipes
+    > import Pipes.ByteString (readHandle)
+    > import System.IO (withFile, FileMode(ReadMode))
+    >
+    > main :: IO ()
+    > main = withFile "my-tar-archive.tar" ReadMode $ \h ->
+    >   runEffect $ runTarP $
+    >     (wrap . hoist liftIO . readHandle h >-> readTar />/ readEntry) ()
+    >
+    >  where
+    >
+    >   readEntry tarEntry = do
+    >     liftIO (print $ entryPath tarEntry)
+    >     (readCurrentEntry >-> discard) ()
+
+    We use 'System.IO.withFile' to open a handle to the tar archive we wish to
+    read, and then 'Pipes.ByteString.readHandle' to stream the contents of this
+    handle into something that can work with @pipes@. 'readTar' requires the
+    stream to be wrapped so it knows when the end of the file is encountered,
+    which we can achieve composing with 'Pipes.Parse.wrap'. As
+    'Pipes.ByteString.readHandle' has 'IO' as its base monad, we use
+    'Control.Monad.Morph.hoist' and 'Control.Monad.IO.Class.liftIO' to allow
+    'Pipes.ByteString.readHandle' to be composed with 'readTar'.
+
+    To connect 'readTar', we use the 'Pipes./>/' combinator which is
+    /respond composition/. Thus @\/>\/ readEntry@ can be understood as
+    substituing all 'Pipe.respond's from 'readTar' (that is, whenever it responds
+    with a 'TarEntry') with a call directly to @readEntry@.
+
+    @readEntry@ is a simple monadic action that uses a combination of
+    'Control.Monad.IO.Class.liftIO' and 'print' to output the 'entryPath'
+    attribute of each 'TarEntry' that 'readTar' reads.
+
+    We have to complete this action by reading all bytes of that tar entry. As we
+    dont plan to do anything with them, we simply 'Pipes.discard' all bytes. If
+    you forget to consume all bytes of a 'TarEntry', you will be informed by a
+    type error:
+
+    This is because the type of 'readEntry' is @Monad m => TarEntry -> Pipes.Proxy ()
+    (Maybe ByteString) b' b m TarReader@ -- notice the return type.
+
+    'TarReader' is a special value, that can be thought of as a token that
+    "grants" a proxy the ability to read from a tar file. @pipes-tar@ uses this
+    to ensure that downstream consumers of a tar file never under- or
+    over-consume the contents of individual entries. The only way you can
+    generate a 'TarReader' is with 'readCurrentEntry' -- notice that '>->'
+    preserves the return type of the leftmost proxy.
+
+    'discard'ing is a little boring though - here's an example of how we can
+    extend @readEntry@ to show all files ending with @.txt@:
+
+    > ...
+    >  where
+    >   readEntry tarEntry
+    >     | ".txt" `isSuffixOf` entryPath tarEntry &&
+    >       entryType tarEntry == File =
+    >         (readCurrentEntry >-> Pipes.print) ()
+    >     | otherwise =
+    >         (readCurrentEntry >-> discard) ()
+-}
+
 -- | Transform a 'BS.ByteString' into a stream of 'TarEntry's. Each 'TarEntry'
--- can be expanded into its respective 'BS.ByteString' using 'readTar'. Parsing
--- tar archives can fail, so you may wish to use the @pipes-safe@ library, which
--- is compatible with 'Pipes.Proxy'.
---
--- Users should note that when 'readTar' is combined with 'readTar' using
--- 'Pipes./>/' (for example, 'readTar' 'Pipes./>/' 'flip' 'readTar' @()),
--- then 'readTar' will have control of terminating the entire 'Proxy' and
--- *not* the down-stream handler. This means that the entire archive will always
--- be streamed, whether or not you consume all files.
+-- can be expanded into its respective 'BS.ByteString' using 'readCurrentEntry'.
 readTar :: Monad m
     => () -> Pipes.Proxy () (Maybe BS.ByteString) TarReader TarEntry (TarT m) ()
 readTar () = fix $ \loop -> do
@@ -238,8 +317,8 @@ readTar () = fix $ \loop -> do
 -- > readTar />/ (\e -> (readCurrentEntry >-> writeFile (entryName e)) ())
 --
 -- This example uses respond composition ('Pipes./>/') to join in the tar
--- entry handler, introduced with @\e@. This allows you to perform some logic on
--- each 'TarEntry' - deciding how/whether you want to process each entry.
+-- entry handler. This allows you to perform some logic on each 'TarEntry -
+-- deciding how/whether you want to process each entry.
 readCurrentEntry
     :: Monad m
     => () -> Pipes.Proxy () (Maybe BS.ByteString) () BS.ByteString
