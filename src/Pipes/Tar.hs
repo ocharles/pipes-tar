@@ -23,10 +23,10 @@ module Pipes.Tar
 --------------------------------------------------------------------------------
 import Control.Applicative
 import Control.Exception
-import Control.Monad (guard, msum, mzero, unless, when)
+import Control.Monad (guard, msum, unless, when)
 import Control.Monad.Trans.Class (lift)
-import Data.Char (intToDigit, isDigit, ord)
-import Data.Digits (digitsRev)
+import Data.Char (digitToInt, intToDigit, isDigit, ord)
+import Data.Digits (digitsRev, unDigits)
 import Data.Foldable (forM_)
 import Data.Function (fix)
 import Data.Monoid (Monoid(..), (<>))
@@ -43,7 +43,6 @@ import qualified Control.Monad.Trans.Either as Either
 import qualified Control.Monad.Trans.State.Strict as State
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as Char8
-import qualified Data.ByteString.Lex.Integral as Lexing
 import qualified Data.Serialize.Get as Get
 import qualified Pipes
 import qualified Pipes.Internal as PI
@@ -129,7 +128,7 @@ decodeTar header = flip Get.runGet header $
     readOctal n = Get.getBytes n >>= parseOctal
 
     parseOctal x =
-        msum [ maybe mzero (return . fst) . Lexing.readOctal .
+        msum [ return $ unDigits 8 . map digitToInt . Char8.unpack .
                    Char8.dropWhile (== ' ') .
                    BS.takeWhile (not . (`elem` [ fromIntegral $ ord ' ', 0 ])) $
                      x
