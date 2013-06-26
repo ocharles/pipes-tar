@@ -1,7 +1,7 @@
 {-# LANGUAGE DeriveDataTypeable #-}
 {-|
     @pipes-tar@ is a library for the @pipes@-ecosystem that provides the ability
-    to read from tar files in constant space, and write tar files using as much
+    to read from tar files in constant memory, and write tar files using as much
     memory as the largest file.
 -}
 module Pipes.Tar
@@ -25,9 +25,9 @@ module Pipes.Tar
     , CompleteEntry
 
       -- ** TarT transformer
-    , TarParseState
     , TarT
     , runTarP
+    , TarParseState
 
       -- ** Exceptions
     , TarException(..)
@@ -220,19 +220,27 @@ encodeTar e =
     Here is an example of how to read a tar file, outputting just the names of
     all entries in the archive:
 
+    > import Control.Monad (void)
+    > import Control.Monad.IO.Class (liftIO)
     > import Pipes
     > import Pipes.ByteString (readHandle)
-    > import System.IO (withFile, FileMode(ReadMode))
+    > import Pipes.Parse (wrap)
+    > import Pipes.Prelude (discard)
+    > import Pipes.Tar
+    > import System.Environment (getArgs)
+    > import System.IO (withFile, IOMode(ReadMode))
     >
     > main :: IO ()
-    > main = withFile "my-tar-archive.tar" ReadMode $ \h ->
-    >   runEffect $ runTarP $
-    >     (wrap . hoist liftIO . readHandle h >-> readTar />/ readEntry) ()
+    > main = do
+    >   (tarPath:_) <- getArgs
+    >   withFile tarPath ReadMode $ \h ->
+    >     void $ runEffect $ runTarP $
+    >       (wrap . hoist liftIO . readHandle h >-> readTar />/ readEntry) ()
     >
     >  where
     >
     >   readEntry tarEntry = do
-    >     liftIO (print $ entryPath tarEntry)
+    >     liftIO $ print . entryPath $ tarEntry
     >     (readCurrentEntry >-> discard) ()
 
     We use 'System.IO.withFile' to open a handle to the tar archive we wish to
@@ -271,16 +279,19 @@ encodeTar e =
     'discard'ing is a little boring though - here's an example of how we can
     extend @readEntry@ to show all files ending with @.txt@:
 
+    > import Data.List (isSuffixOf)
     > ...
     >  where
     >   readEntry tarEntry
     >     | ".txt" `isSuffixOf` entryPath tarEntry &&
     >       entryType tarEntry == File =
-    >         (readCurrentEntry >-> Pipes.print) ()
+    >         (readCurrentEntry >-> hoist liftIO . Pipes.Prelude.print) ()
     >     | otherwise =
     >         (readCurrentEntry >-> discard) ()
 -}
 
+
+--------------------------------------------------------------------------------
 -- | Transform a 'BS.ByteString' into a stream of 'TarEntry's. Each 'TarEntry'
 -- can be expanded into its respective 'BS.ByteString' using 'readCurrentEntry'.
 readTar :: Monad m
@@ -348,13 +359,70 @@ readCurrentEntry () = do
                     Parse.zoom pushBack $ Parse.unDraw suffix
                     Pipes.respond prefix
 
+--------------------------------------------------------------------------------
+{- $writing
+    Like reading, writing tar files is done using @writeEntry@ type functions for
+    the individual files inside a tar archive, and a final 'writeTar' 'P.Pipe' to
+    produce a correctly formatted stream of 'BS.ByteString's.
+
+    However, unlike reading, writing tar files can be done entirely with *pull
+    composition*. Here's an example of producing a tar archive with one file in a
+    directory:
+
+    > import Data.Text
+    > import Data.Text.Encoding (encodeUtf8)
+    > import Pipes
+    > import Pipes.ByteString (writeHandle)
+    > import Pipes.Parse (wrap)
+    > import Pipes.Tar
+    > import Data.Time (getCurrentTime)
+    > import System.IO (withFile, IOMode(WriteMode))
+    >
+    > main :: IO ()
+    > main = withFile "hello.tar" WriteMode $ \h ->
+    >   runEffect $
+    >     (wrap . tarEntries >-> writeTar >-> writeHandle h) ()
+    >
+    >  where
+    >
+    >   tarEntries () = do
+    >     now <- lift getCurrentTime
+    >     writeDirectoryEntry "text" 0 0 0 now
+    >     writeFileEntry "text/hello" 0 0 0 now <-<
+    >       (wrap . const (respond (encodeUtf8 "Hello!"))) $ ()
+
+    First, lets try and understand @tarEntries@, as this is the bulk of the work.
+    @tarEntries@ is a 'Pipes.Producer', which is responsible for producing
+    'CompleteEntry's for 'writeTar' to consume. A 'CompleteEntry' is a
+    combination of a 'TarEntry' along with any associated data. This bundled is
+    necessary to ensure that when writing the tar, we don't produce a header
+    where the size header itself doesn't match the actual amount of data that
+    follows. It's for this reason 'CompleteEntry''s constructor is private - you
+    can only respond with 'CompleteEntry's using primitives provided by
+    @pipes-tar@.
+
+    The first primitive we use is 'writeDirectory', which takes no input and
+    responds with a directory entry. The next response is a little bit more
+    complicated. Here, I'm writing a text file to the path "text/hello" with the
+    contents "Hello!". 'writeFileEntry' is a 'Pipes.Pipe' that consumes a
+    'Nothing' terminated stream of 'BS.ByteStrings', and responds with a
+    corresponding 'CompleteEntry'. I've used flipped pull combination ('<-<') to
+    avoid more parenthesis, and 'Pipes.Parse.wrap' a single 'respond' call which
+    produces the actual file contents.
+-}
+
 
 --------------------------------------------------------------------------------
+-- | A 'CompleteEntry' is a 'TarEntry' along with any corresponding data. These
+-- values are constructed using the @writeEntry@ family of functions (e.g.,
+-- 'writeFileEntry').
 data CompleteEntry = CompleteEntry TarEntry BS.ByteString
   deriving (Eq, Show)
 
 
 --------------------------------------------------------------------------------
+-- | Fold all 'Just BS.ByteString's into a single 'CompleteEntry' with file
+-- related metadata.
 writeFileEntry
     :: Monad m
     => FilePath -> FileMode -> Int -> Int -> UTCTime ->
@@ -386,6 +454,7 @@ writeFileEntry path mode uid gid modified () = do
 
 
 --------------------------------------------------------------------------------
+-- | Produce a single 'CompleteEntry' with correct metadata for a directory.
 writeDirectoryEntry
     :: Monad m
     => FilePath -> FileMode -> Int -> Int -> UTCTime
@@ -406,6 +475,9 @@ writeDirectoryEntry path mode uid gid modified = do
 
 
 --------------------------------------------------------------------------------
+-- | Convert a stream of 'Nothing' terminated 'CompleteEntry's into a
+-- 'BS.ByteString' stream. Terminates after writing the EOF marker when the
+-- first 'Nothing' value is consumed.
 writeTar :: Monad m => () -> Pipes.Pipe (Maybe CompleteEntry) BS.ByteString m ()
 writeTar () = fix $ \next -> do
     entry <- Pipes.request ()
