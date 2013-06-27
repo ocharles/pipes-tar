@@ -45,7 +45,6 @@ import Control.Monad.Trans.Class (lift)
 import Data.Char (digitToInt, intToDigit, isDigit, ord)
 import Data.Digits (digitsRev, unDigits)
 import Data.Foldable (forM_)
-import Data.Function (fix)
 import Data.Monoid (Monoid(..), (<>))
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime, utcTimeToPOSIXSeconds)
 import Data.Time (UTCTime)
@@ -97,10 +96,10 @@ newtype TarReader = TarR ()
 --------------------------------------------------------------------------------
 -- | Possible errors that can occur when reading tar files
 data TarException
-  = -- | The header for a tar entry could not be parsed
-    InvalidHeader BS.ByteString String
-  | -- | The EOF marker in the archive could not be parsed
-    InvalidEOF
+    = -- | The header for a tar entry could not be parsed
+      InvalidHeader BS.ByteString String
+    | -- | The EOF marker in the archive could not be parsed
+      InvalidEOF
   deriving (Show, Typeable)
 
 instance Exception TarException
@@ -108,15 +107,17 @@ instance Exception TarException
 
 --------------------------------------------------------------------------------
 -- | A 'TarEntry' contains all the metadata about a single entry in a tar file.
-data TarEntry = TarEntry { entryPath :: !FilePath
-                         , entryMode :: !FileMode
-                         , entryUID :: !Int
-                         , entryGID :: !Int
-                         , entrySize :: !Int
-                         , entryLastModified :: !UTCTime
-                         , entryType :: !EntryType
-                         , entryLinkName :: !String
-                         }
+data TarEntry
+    = TarEntry
+        { entryPath :: !FilePath
+        , entryMode :: !FileMode
+        , entryUID :: !Int
+        , entryGID :: !Int
+        , entrySize :: !Int
+        , entryLastModified :: !UTCTime
+        , entryType :: !EntryType
+        , entryLinkName :: !String
+        }
     deriving (Eq, Show)
 
 
@@ -294,24 +295,24 @@ encodeTar e =
 --------------------------------------------------------------------------------
 -- | Transform a 'BS.ByteString' into a stream of 'TarEntry's. Each 'TarEntry'
 -- can be expanded into its respective 'BS.ByteString' using 'readCurrentEntry'.
-readTar :: Monad m
+readTar
+    :: Monad m
     => () -> Pipes.Proxy () (Maybe BS.ByteString) TarReader TarEntry (TarT m) ()
-readTar () = fix $ \loop -> do
+readTar () = do
     header <- Parse.zoom pushBack $ drawBytesUpTo 512
 
     if BS.all (== 0) header
         then parseEOF
-        else parseHeader header loop
+        else parseHeader header >> readTar ()
 
   where
-    parseHeader header loop =
+    parseHeader header =
         case decodeTar header of
             Left e -> lift . lift . Either.left . toException $
                 InvalidHeader header e
             Right e -> do
                 Parse.zoom currentTarEntry $ lift $ State.put (Just e)
                 Pipes.respond e
-                loop
 
     parseEOF = do
         part2 <- Parse.zoom pushBack $ drawBytesUpTo 512
@@ -332,8 +333,8 @@ readTar () = fix $ \loop -> do
 -- deciding how/whether you want to process each entry.
 readCurrentEntry
     :: Monad m
-    => () -> Pipes.Proxy () (Maybe BS.ByteString) () BS.ByteString
-                 (TarT m) TarReader
+    => ()
+    -> Pipes.Proxy () (Maybe BS.ByteString) () BS.ByteString (TarT m) TarReader
 readCurrentEntry () = do
     e <- Parse.zoom currentTarEntry $ lift State.get
     forM_ e $ \entry ->
@@ -403,10 +404,10 @@ readCurrentEntry () = do
 
     The first primitive we use is 'writeDirectory', which takes no input and
     responds with a directory entry. The next response is a little bit more
-    complicated. Here, I'm writing a text file to the path "text/hello" with the
-    contents "Hello!". 'writeFileEntry' is a 'Pipes.Pipe' that consumes a
+    complicated. Here, I'm writing a text file to the path \"text/hello\" with the
+    contents \"Hello!\". 'writeFileEntry' is a 'Pipes.Pipe' that consumes a
     'Nothing' terminated stream of 'BS.ByteStrings', and responds with a
-    corresponding 'CompleteEntry'. I've used flipped pull combination ('<-<') to
+    corresponding 'CompleteEntry'. I've used flipped pull combination ('Pipes.<-<') to
     avoid more parenthesis, and 'Pipes.Parse.wrap' a single 'respond' call which
     produces the actual file contents.
 -}
@@ -425,8 +426,8 @@ data CompleteEntry = CompleteEntry TarEntry BS.ByteString
 -- related metadata.
 writeFileEntry
     :: Monad m
-    => FilePath -> FileMode -> Int -> Int -> UTCTime ->
-    () -> Pipes.Pipe (Maybe BS.ByteString) CompleteEntry m ()
+    => FilePath -> FileMode -> Int -> Int -> UTCTime
+    -> () -> Pipes.Pipe (Maybe BS.ByteString) CompleteEntry m ()
 writeFileEntry path mode uid gid modified () = do
     content <- mconcat <$> requestAll
     let header =
@@ -479,7 +480,7 @@ writeDirectoryEntry path mode uid gid modified = do
 -- 'BS.ByteString' stream. Terminates after writing the EOF marker when the
 -- first 'Nothing' value is consumed.
 writeTar :: Monad m => () -> Pipes.Pipe (Maybe CompleteEntry) BS.ByteString m ()
-writeTar () = fix $ \next -> do
+writeTar () = do
     entry <- Pipes.request ()
     case entry of
         Nothing -> Pipes.respond (BS.replicate 1024 0)
@@ -489,7 +490,7 @@ writeTar () = fix $ \next -> do
             Pipes.respond content
             unless (fileSize `mod` 512 == 0) $
                 Pipes.respond (BS.replicate (512 - fileSize `mod` 512) 0)
-            next
+            writeTar ()
 
 
 --------------------------------------------------------------------------------
@@ -499,9 +500,10 @@ type TarT m = State.StateT TarParseState (Either.EitherT SomeException m)
 
 
 -- | Run a 'TarP' 'Pipes.Proxy'.
-runTarP :: Monad m =>
-    Pipes.Proxy a' a b' b (TarT m) r ->
-    Pipes.Proxy a' a b' b m (Either SomeException r)
+runTarP
+    :: Monad m
+    => Pipes.Proxy a' a b' b (TarT m) r
+    -> Pipes.Proxy a' a b' b m (Either SomeException r)
 runTarP = runEitherP . Pipes.evalStateP startingState
   where
     startingState = TarParseState [] Nothing
