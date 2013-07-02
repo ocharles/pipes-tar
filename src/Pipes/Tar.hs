@@ -297,9 +297,11 @@ encodeTar e =
 -- can be expanded into its respective 'BS.ByteString' using 'readCurrentEntry'.
 readTar
     :: Monad m
-    => () -> Pipes.Proxy () (Maybe BS.ByteString) TarReader TarEntry (TarT m) ()
+    => ()
+    -> Pipes.Proxy Parse.Draw (Maybe BS.ByteString) TarReader TarEntry
+        (TarT m) ()
 readTar () = do
-    header <- Parse.zoom pushBack $ drawBytesUpTo 512
+    header <- zoom pushBack $ drawBytesUpTo 512
 
     if BS.all (== 0) header
         then parseEOF
@@ -311,11 +313,11 @@ readTar () = do
             Left e -> lift . lift . Either.left . toException $
                 InvalidHeader header e
             Right e -> do
-                Parse.zoom currentTarEntry $ lift $ State.put (Just e)
+                zoom currentTarEntry $ lift $ State.put (Just e)
                 Pipes.respond e
 
     parseEOF = do
-        part2 <- Parse.zoom pushBack $ drawBytesUpTo 512
+        part2 <- zoom pushBack $ drawBytesUpTo 512
         when (BS.all (/= 0) part2) $
             lift . lift . Either.left . toException $ InvalidEOF
 
@@ -334,21 +336,22 @@ readTar () = do
 readCurrentEntry
     :: Monad m
     => ()
-    -> Pipes.Proxy () (Maybe BS.ByteString) () BS.ByteString (TarT m) TarReader
+    -> Pipes.Proxy Parse.Draw (Maybe BS.ByteString) () BS.ByteString
+        (TarT m) TarReader
 readCurrentEntry () = do
-    e <- Parse.zoom currentTarEntry $ lift State.get
+    e <- zoom currentTarEntry $ lift State.get
     forM_ e $ \entry ->
         case entryType entry of
             File -> do
                 loop entry (entrySize entry)
-                Parse.zoom pushBack $
+                zoom pushBack $
                     skipBytesUpTo (512 - entrySize entry `mod` 512)
             _ -> return ()
 
     return $ TarR ()
   where
     loop entry remainder = when (remainder > 0) $ do
-        mbs <- Parse.zoom pushBack Parse.draw
+        mbs <- zoom pushBack Parse.draw
         forM_ mbs $ \bs -> do
             let len = BS.length bs
             if len <= remainder
@@ -357,7 +360,7 @@ readCurrentEntry () = do
                     loop entry (remainder - len)
                 else do
                     let (prefix, suffix) = BS.splitAt remainder bs
-                    Parse.zoom pushBack $ Parse.unDraw suffix
+                    zoom pushBack $ Parse.unDraw suffix
                     Pipes.respond prefix
 
 --------------------------------------------------------------------------------
@@ -499,6 +502,7 @@ writeTar () = do
 type TarT m = State.StateT TarParseState (Either.EitherT SomeException m)
 
 
+--------------------------------------------------------------------------------
 -- | Run a 'TarP' 'Pipes.Proxy'.
 runTarP
     :: Monad m
@@ -516,3 +520,21 @@ runTarP = runEitherP . Pipes.evalStateP startingState
             return (case x of
                 Left e -> PI.Pure (Left e)
                 Right p' -> runEitherP p' ) )
+
+
+--------------------------------------------------------------------------------
+zoom
+    :: Monad m
+    => ((s2 -> (s2, s2)) -> (s1 -> (s2, s1)))
+    -- ^ @Lens'@ s1 s2
+    -> Pipes.Proxy a' a b' b (State.StateT s2 m) r
+    -- ^ Local state
+    -> Pipes.Proxy a' a b' b (State.StateT s1 m) r
+    -- ^ Global state
+zoom lens = Pipes.hoist (morph lens)
+  where
+    morph l (State.StateT f) = State.StateT $ \s ->
+      let (s2, _) = l (\x -> (x, x)) s
+      in f s2 >>= \(r, s2') ->
+          let (_, s1') = l (\x -> (x, s2')) s
+          in return (r, s1')
