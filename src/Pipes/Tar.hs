@@ -342,7 +342,7 @@ readCurrentEntry () = do
     e <- zoom currentTarEntry $ lift State.get
     forM_ e $ \entry ->
         case entryType entry of
-            File -> do
+            File -> when (entrySize entry > 0) $ do
                 loop entry (entrySize entry)
                 zoom pushBack $
                     skipBytesUpTo (512 - entrySize entry `mod` 512)
