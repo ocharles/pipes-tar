@@ -23,6 +23,7 @@ library
     cereal >= 0.3,
     digits,
     either,
+    free,
     mmorph,
     mtl,
     pipes >= 3.3,
