@@ -1,4 +1,3 @@
-{-# LANGUAGE RecordWildCards #-}
 {-|
     @pipes-tar@ is a library for the @pipes@-ecosystem that provides the ability
     to read from tar files in constant memory, and write tar files using as much
@@ -20,11 +19,10 @@ module Pipes.Tar
 
 --------------------------------------------------------------------------------
 import Control.Applicative
-import Control.Monad (guard)
+import Control.Monad ((>=>), guard)
 import Control.Monad.Trans.Free (FreeT(..), FreeF(..))
 import Data.Char (digitToInt, intToDigit, isDigit, ord)
 import Data.Digits (digitsRev, unDigits)
-import Data.Maybe (fromMaybe)
 import Data.Monoid ((<>), mconcat, mempty)
 import Data.Time (UTCTime)
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime, utcTimeToPOSIXSeconds)
@@ -153,22 +151,22 @@ parseTarEntries upstream = FreeT $ do
     | BS.all (== 0) headerBytes = do
         (eofMarker, rest) <- Parse.runStateT (drawBytesUpTo 512) remainder
 
-        return $
+        return $ Pure $
           if BS.all (== 0) eofMarker
-            then Pure rest
-            else Pure (Pipes.yield eofMarker >> rest)
+            then rest
+            else Pipes.yield eofMarker >> rest
 
     | otherwise =
         case decodeTar headerBytes of
           Left _ -> return (Pure (Pipes.yield headerBytes >> remainder))
           Right header ->
-            return $ Free $ TarEntry header $ parseBody remainder header
+            return $ Free $ TarEntry header $ parseBody header remainder
 
-  parseBody prod header = parseTarEntries <$> produceBody prod >>= consumePadding
+  parseBody header = fmap parseTarEntries . produceBody
 
    where
 
-    produceBody = yieldBytesUpTo (entrySize header)
+    produceBody = yieldBytesUpTo (entrySize header) >=> consumePadding
 
     consumePadding p
       | entrySize header == 0 = return p
@@ -206,8 +204,7 @@ drawBytesUpTo = loop mempty
     | remaining <= 0 = return acc
     | otherwise = do
         (bytes, suffix) <-
-          fromMaybe (mempty, mempty) . fmap (BS.splitAt remaining) <$>
-            Parse.draw
+          maybe (mempty, mempty) (BS.splitAt remaining) <$> Parse.draw
         let acc' = acc <> bytes
         if BS.null suffix
             then loop acc' (remaining - BS.length bytes)
@@ -220,7 +217,7 @@ yieldBytesUpTo
   => Int
   -> Pipes.Producer BS.ByteString m r
   -> Pipes.Producer BS.ByteString m (Pipes.Producer BS.ByteString m r)
-yieldBytesUpTo maxBytes = loop maxBytes
+yieldBytesUpTo = loop
 
  where
 
