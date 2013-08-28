@@ -12,21 +12,22 @@ module Pipes.Tar
       -- * Writing
       -- $writing
 
-      -- * API Reference
-      -- ** Parsing Isomorphisms
+      -- * 'TarEntry'
+    , TarHeader(..)
+    , TarEntry, tarHeader, tarContent
+    , EntryType(..)
     ) where
 
 --------------------------------------------------------------------------------
 import Control.Applicative
-import Control.Monad (guard, join, unless, when)
-import Control.Monad.Trans.Free (FreeT(..), FreeF(..), iterT)
+import Control.Monad (guard)
+import Control.Monad.Trans.Free (FreeT(..), FreeF(..))
 import Data.Char (digitToInt, intToDigit, isDigit, ord)
 import Data.Digits (digitsRev, unDigits)
 import Data.Maybe (fromMaybe)
 import Data.Monoid ((<>), mconcat, mempty)
 import Data.Time (UTCTime)
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime, utcTimeToPOSIXSeconds)
-import Pipes ((>->))
 import System.Posix.Types (CMode(..), FileMode)
 
 --------------------------------------------------------------------------------
@@ -34,9 +35,7 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as Char8
 import qualified Data.Serialize.Get as Get
 import qualified Pipes
-import qualified Pipes.ByteString as Pipes
 import qualified Pipes.Parse as Parse
-import qualified Pipes.Prelude as Pipes
 
 --------------------------------------------------------------------------------
 -- | A 'TarEntry' contains all the metadata about a single entry in a tar file.
@@ -54,14 +53,145 @@ data TarHeader
     deriving (Eq, Show)
 
 
+--------------------------------------------------------------------------------
 data EntryType = File | Directory
     deriving (Eq, Show)
 
 
-data TarEntry m r = TarEntry TarHeader (Pipes.Producer BS.ByteString m r)
+--------------------------------------------------------------------------------
+data TarEntry m r = TarEntry { tarHeader :: TarHeader
+                             , tarContent :: Pipes.Producer BS.ByteString m r
+                             }
 
 instance Monad m => Functor (TarEntry m) where
   fmap f (TarEntry header r) = TarEntry header (fmap f r)
+
+----------------------------------------------------------------------------------
+--{- $reading
+--    tar files are read using 'parseTarEntries'.  In short, 'parseTarEntries' is
+--    used to read the format of a tar file, turning a stream of bytes into a
+--    stream of 'TarEntry's. The stream is contained under a free monad, which
+--    forces you to consume each tar entry in order (as streams can only be read
+--    in the forward direction).
+--
+--    Here is an example of how to read a tar file, outputting just the names of
+--    all entries in the archive:
+--
+--    > import Control.Monad (void)
+--    > import Control.Monad.IO.Class (liftIO)
+--    > import Pipes
+--    > import Pipes.ByteString (readHandle)
+--    > import Pipes.Parse (wrap)
+--    > import Pipes.Prelude (discard)
+--    > import Pipes.Tar
+--    > import System.Environment (getArgs)
+--    > import System.IO (withFile, IOMode(ReadMode))
+--    >
+--    > main :: IO ()
+--    > main = do
+--    >   (tarPath:_) <- getArgs
+--    >   withFile tarPath ReadMode $ \h ->
+--    >     void $ iterT readEntry (parseTarEntry (readHandle h))
+--    >
+--    >  where
+--    >
+--    >   readEntry (TarEntry header k) = do
+--    >     putStrLn . entryPath $ header
+--    >     join (run (for k (const $ return ()))))
+--
+--    We use 'System.IO.withFile' to open a handle to the tar archive we wish to
+--    read, and then 'Pipes.ByteString.readHandle' to stream the contents of this
+--    handle into something that can work with @pipes@. We then convert a file
+--    handle into a 'BS.ByteString' by using 'readHandle'.
+--
+--    As mentioned before, 'parseTarEntries' yields a free monad, and we can
+--    destruct this using 'iterT'. We pass 'iterT' a function to operate on each
+--    element, and the whole tar entry will be consumed from the start. The
+--    important thing to note here is that each element contains the next
+--    element in the stream as the return type of its content producer. It is
+--    this property that forces us to consume every entry in order.
+--
+--    Our function to 'iterT' simply prints the 'entryPath' of a 'TarHeader',
+--    and then runs the 'Pipes.Producer' for the content - substituting each
+--    'Pipes.yield' with an empty action using 'Pipes.for'. Running this will
+--    return us the 'IO ()' action that streams the /next/ 'TarEntry', so we
+--    just 'join' that directly to ourselves.
+--
+--    Discarding content is a little boring though - here's an example of how we
+--    can extend @readEntry@ to show all files ending with @.txt@:
+--
+--    > import Data.List (isSuffixOf)
+--    > ...
+--    >  where
+--    >   readEntry (TarEntry header k) =
+--    >     let reader = if ".txt" `isSuffixOf` entryPath tarEntry &&
+--    >                       entryType tarEntry == File =
+--    >                    then lift . putStrLn
+--    >                    else (const (return ()))
+--    >     in join (run (for k reader))
+--
+--    We now have two branches in @readEntry@ - and we choose a branch depending
+--    on whether or not we are looking at a file with a file name ending in
+--    ".txt". If so, we read the body by substitutting each 'Pipes.yield' with
+--    'putStr'. If not, then we discard the contents as before. Either way, we
+--    run the entire producer, and make sure to 'join' the next entry.
+---}
+parseTarEntries
+  :: (Functor m, Monad m)
+  => Pipes.Producer BS.ByteString m ()
+  -> FreeT (TarEntry m) m (Pipes.Producer BS.ByteString m ())
+parseTarEntries upstream = FreeT $ do
+  (headerBytes, rest) <- Parse.runStateT (drawBytesUpTo 512) upstream
+  go headerBytes rest
+
+ where
+
+  go headerBytes remainder
+    | BS.length headerBytes < 512 =
+        return $ Pure (Pipes.yield headerBytes >> remainder)
+
+    | BS.all (== 0) headerBytes = do
+        (eofMarker, rest) <- Parse.runStateT (drawBytesUpTo 512) remainder
+
+        return $
+          if BS.all (== 0) eofMarker
+            then Pure rest
+            else Pure (Pipes.yield eofMarker >> rest)
+
+    | otherwise =
+        case decodeTar headerBytes of
+          Left _ -> return (Pure (Pipes.yield headerBytes))
+          Right header ->
+            return $ Free $ TarEntry header $ parseBody remainder header
+
+  parseBody prod header = parseTarEntries <$> produceBody prod >>= consumePadding
+
+   where
+
+    produceBody = yieldBytesUpTo (entrySize header)
+
+    consumePadding p
+      | entrySize header == 0 = return p
+      | otherwise =
+          let padding = 512 - entrySize header `mod` 512
+          in Pipes.for (yieldBytesUpTo padding p) (const $ return ())
+
+--------------------------------------------------------------------------------
+{-serializeTarEntries-}
+  {-:: Monad m-}
+  {-=> FreeT (TarEntry m) m (Pipes.Producer BS.ByteString m ())-}
+  {--> Pipes.Producer BS.ByteString m ()-}
+{-serializeTarEntries freed = join . Pipes.lift . iterT iterator-}
+
+ {-where-}
+
+  {-iterator (TarEntry header body) = do-}
+    {-b <- body-}
+    {-return body-}
+    {-return $ do-}
+      {-Pipes.yield (encodeTar header)-}
+      {-b-}
+    --Pipes.run body
 
 --------------------------------------------------------------------------------
 drawBytesUpTo
@@ -108,72 +238,6 @@ yieldBytesUpTo maxBytes = loop maxBytes
                 else return (Pipes.yield suffix >> k)
 
 --------------------------------------------------------------------------------
-parseTarEntries
-  :: (Functor m, Monad m)
-  => Pipes.Producer BS.ByteString m ()
-  -> FreeT (TarEntry m) m (Pipes.Producer BS.ByteString m ())
-parseTarEntries upstream = FreeT $ do
-  (headerBytes, rest) <- Parse.runStateT (drawBytesUpTo 512) upstream
-  go headerBytes rest
-
- where
-
-  go headerBytes remainder
-    | BS.length headerBytes < 512 =
-        return $ Pure (Pipes.yield headerBytes >> remainder)
-
-    | BS.all (== 0) headerBytes = do
-        (eofMarker, rest) <- Parse.runStateT (drawBytesUpTo 512) remainder
-
-        return $
-          if BS.all (== 0) eofMarker
-            then Pure rest
-            else Pure (Pipes.yield eofMarker >> rest)
-
-    | otherwise =
-        case decodeTar headerBytes of
-          Left _ -> return (Pure (Pipes.yield headerBytes))
-          Right header ->
-            return $ Free $ TarEntry header $ parseBody remainder header
-
-  parseBody prod header = parseTarEntries <$> do
-    produceBody prod >>= consumePadding
-
-   where
-
-    produceBody = yieldBytesUpTo (entrySize header)
-
-    consumePadding p
-      | entrySize header == 0 = return p
-      | otherwise =
-          let padding = 512 - entrySize header `mod` 512
-          in Pipes.for (yieldBytesUpTo padding p) (const $ return ())
-
---------------------------------------------------------------------------------
-{-serializeTarEntries-}
-  {-:: Monad m-}
-  {-=> FreeT (TarEntry m) m (Pipes.Producer BS.ByteString m ())-}
-  {--> Pipes.Producer BS.ByteString m ()-}
-{-serializeTarEntries freed = join . Pipes.lift . iterT iterator-}
-
- {-where-}
-
-  {-iterator (TarEntry header body) = do-}
-    {-b <- body-}
-    {-return body-}
-    {-return $ do-}
-      {-Pipes.yield (encodeTar header)-}
-      {-b-}
-    --Pipes.run body
-
---------------------------------------------------------------------------------
--- | Utility function to fold the entire ByteString producer into
--- a ByteString
-drawAll
-  :: Monad m => Parse.StateT (Pipes.Producer BS.ByteString m r) m BS.ByteString
-drawAll = Pipes.fold BS.append BS.empty id Parse.input
-
---------------------------------------------------------------------------------
 decodeTar :: BS.ByteString -> Either String TarHeader
 decodeTar header = flip Get.runGet header $
     TarHeader <$> parseASCII 100
@@ -197,7 +261,7 @@ decodeTar header = flip Get.runGet header $
     parseOctal :: BS.ByteString -> Int
     parseOctal x
         | BS.head x == 128 =
-            foldl (\acc x -> acc * 256 + fromIntegral x) 0 .
+            foldl (\acc y -> acc * 256 + fromIntegral y) 0 .
                 BS.unpack . BS.drop 1 $ x
         | otherwise =
             unDigits 8 . map digitToInt . Char8.unpack .
@@ -216,6 +280,7 @@ decodeTar header = flip Get.runGet header $
             right = BS.drop 8 rest
         in (sum :: [Int] -> Int) $ map fromIntegral $ concatMap BS.unpack
             [ left, Char8.replicate 8 ' ', right ]
+
 
 --------------------------------------------------------------------------------
 encodeTar :: TarHeader -> BS.ByteString
@@ -257,87 +322,6 @@ encodeTar e =
     zeroPad l = replicate (max 0 $ n - length l + 1) '0' ++ l
 
 
-----------------------------------------------------------------------------------
---{- $reading
---    tar files are read using two functions provided by @pipes-tar@ - 'readTar'
---    and 'readCurrentEntry'. In short, 'readTar' is used to read the format of a
---    tar file, turning a stream of bytes into a stream of 'TarEntry's, while
---    'readCurrentEntry' is used to stream the contents of the current file.
---
---    Here is an example of how to read a tar file, outputting just the names of
---    all entries in the archive:
---
---    > import Control.Monad (void)
---    > import Control.Monad.IO.Class (liftIO)
---    > import Pipes
---    > import Pipes.ByteString (readHandle)
---    > import Pipes.Parse (wrap)
---    > import Pipes.Prelude (discard)
---    > import Pipes.Tar
---    > import System.Environment (getArgs)
---    > import System.IO (withFile, IOMode(ReadMode))
---    >
---    > main :: IO ()
---    > main = do
---    >   (tarPath:_) <- getArgs
---    >   withFile tarPath ReadMode $ \h ->
---    >     void $ runEffect $ runTarP $
---    >       (wrap . hoist liftIO . readHandle h >-> readTar />/ readEntry) ()
---    >
---    >  where
---    >
---    >   readEntry tarEntry = do
---    >     liftIO $ print . entryPath $ tarEntry
---    >     (readCurrentEntry >-> discard) ()
---
---    We use 'System.IO.withFile' to open a handle to the tar archive we wish to
---    read, and then 'Pipes.ByteString.readHandle' to stream the contents of this
---    handle into something that can work with @pipes@. 'readTar' requires the
---    stream to be wrapped so it knows when the end of the file is encountered,
---    which we can achieve composing with 'Pipes.Parse.wrap'. As
---    'Pipes.ByteString.readHandle' has 'IO' as its base monad, we use
---    'Control.Monad.Morph.hoist' and 'Control.Monad.IO.Class.liftIO' to allow
---    'Pipes.ByteString.readHandle' to be composed with 'readTar'.
---
---    To connect 'readTar', we use the 'Pipes./>/' combinator which is
---    /respond composition/. Thus @\/>\/ readEntry@ can be understood as
---    substituing all 'Pipe.respond's from 'readTar' (that is, whenever it responds
---    with a 'TarEntry') with a call directly to @readEntry@.
---
---    @readEntry@ is a simple monadic action that uses a combination of
---    'Control.Monad.IO.Class.liftIO' and 'print' to output the 'entryPath'
---    attribute of each 'TarEntry' that 'readTar' reads.
---
---    We have to complete this action by reading all bytes of that tar entry. As we
---    dont plan to do anything with them, we simply 'Pipes.discard' all bytes. If
---    you forget to consume all bytes of a 'TarEntry', you will be informed by a
---    type error:
---
---    This is because the type of 'readEntry' is @Monad m => TarEntry -> Pipes.Proxy ()
---    (Maybe ByteString) b' b m TarReader@ -- notice the return type.
---
---    'TarReader' is a special value, that can be thought of as a token that
---    "grants" a proxy the ability to read from a tar file. @pipes-tar@ uses this
---    to ensure that downstream consumers of a tar file never under- or
---    over-consume the contents of individual entries. The only way you can
---    generate a 'TarReader' is with 'readCurrentEntry' -- notice that '>->'
---    preserves the return type of the leftmost proxy.
---
---    'discard'ing is a little boring though - here's an example of how we can
---    extend @readEntry@ to show all files ending with @.txt@:
---
---    > import Data.List (isSuffixOf)
---    > ...
---    >  where
---    >   readEntry tarEntry
---    >     | ".txt" `isSuffixOf` entryPath tarEntry &&
---    >       entryType tarEntry == File =
---    >         (readCurrentEntry >-> hoist liftIO . Pipes.Prelude.print) ()
---    >     | otherwise =
---    >         (readCurrentEntry >-> discard) ()
----}
---
---
 ----------------------------------------------------------------------------------
 --{- $writing
 --    Like reading, writing tar files is done using @writeEntry@ type functions for
@@ -469,29 +453,3 @@ encodeTar e =
 --            unless (fileSize `mod` 512 == 0) $
 --                Pipes.respond (BS.replicate (512 - fileSize `mod` 512) 0)
 --            writeTar ()
---
---
-----------------------------------------------------------------------------------
----- | The 'TarT' monad transformer is  'State.StateT' with
----- 'TarParseState' as state, and the possibility of errors via 'SomeException'
---type TarT m = State.StateT TarParseState (Either.EitherT SomeException m)
---
---
-----------------------------------------------------------------------------------
----- | Run a 'TarP' 'Pipes.Proxy'.
---runTarP
---    :: Monad m
---    => Pipes.Proxy a' a b' b (TarT m) r
---    -> Pipes.Proxy a' a b' b m (Either SomeException r)
---runTarP = runEitherP . Pipes.evalStateP startingState
---  where
---    startingState = TarParseState [] Nothing
---    runEitherP p = case p of
---        PI.Request a' fa -> PI.Request a' (\a -> runEitherP (fa a ))
---        PI.Respond b fb' -> PI.Respond b (\b' -> runEitherP (fb' b'))
---        PI.Pure r -> PI.Pure (Right r)
---        PI.M m -> PI.M (do
---            x <- Either.runEitherT m
---            return (case x of
---                Left e -> PI.Pure (Left e)
---                Right p' -> runEitherP p' ) )
