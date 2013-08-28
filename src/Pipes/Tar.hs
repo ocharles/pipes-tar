@@ -160,7 +160,7 @@ parseTarEntries upstream = FreeT $ do
 
     | otherwise =
         case decodeTar headerBytes of
-          Left _ -> return (Pure (Pipes.yield headerBytes))
+          Left _ -> return (Pure (Pipes.yield headerBytes >> remainder))
           Right header ->
             return $ Free $ TarEntry header $ parseBody remainder header
 
