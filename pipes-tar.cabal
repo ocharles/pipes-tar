@@ -29,7 +29,6 @@ library
     pipes >= 3.3,
     pipes-bytestring >= 1.0,
     pipes-parse >= 1.0.0,
-    semigroups,
     time >= 1.4,
     transformers
   hs-source-dirs: src
