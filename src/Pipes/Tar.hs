@@ -27,7 +27,8 @@ import Control.Monad.Trans.Free (FreeT(..), FreeF(..), iterT, transFreeT)
 import Control.Monad.Writer.Class (tell)
 import Data.Char (digitToInt, intToDigit, isDigit, ord)
 import Data.Digits (digitsRev, unDigits)
-import Data.Monoid ((<>), mconcat, Sum(..))
+import Data.Monoid (mconcat, Sum(..))
+import Data.Semigroup (Semigroup(..))
 import Data.Time (UTCTime)
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime, utcTimeToPOSIXSeconds)
 import Data.Tuple (swap)
@@ -76,6 +77,9 @@ instance Monad m => Functor (TarEntry m) where
 ----------------------------------------------------------------------------------
 newtype TarArchive m = TarArchive (FreeT (TarEntry m) m
                                    (Pipes.Producer BS.ByteString m ()))
+
+instance Monad m => Semigroup (TarArchive m) where
+  (TarArchive a) <> (TarArchive b) = TarArchive (a >> b)
 
 iterTarArchive
   :: Monad m
