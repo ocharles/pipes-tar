@@ -66,12 +66,17 @@ data EntryType = File | Directory
 
 
 --------------------------------------------------------------------------------
-data TarEntry m r = TarEntry { tarHeader :: TarHeader
-                             , tarContent :: Pipes.Producer BS.ByteString m r
-                             }
+data TarEntry m r
+  = TarEntry { tarHeader :: TarHeader
+             , tarContent :: Pipes.Producer BS.ByteString m r
+             }
+  | TarEntryProducer { mkTarHeader :: Int -> TarHeader
+                     , tarContent :: Pipes.Producer BS.ByteString m r
+                     }
 
 instance Monad m => Functor (TarEntry m) where
   fmap f (TarEntry header r) = TarEntry header (fmap f r)
+  fmap f (TarEntryProducer mkHeader r) = TarEntryProducer mkHeader (fmap f r)
 
 ----------------------------------------------------------------------------------
 newtype TarArchive m = TarArchive (FreeT (TarEntry m) m
@@ -345,45 +350,45 @@ writeTarArchive (TarArchive archive) = Parse.concat (transFreeT f (void archive)
       Pipes.yield (encodeTar h)
       (r, Sum fileSize) <- Pipes.runWriterP $
         Pipes.hoist Pipes.lift content >-> Pipes.chain (tell . Sum . BS.length)
-      unless (fileSize `mod` 512 == 0) $
-          Pipes.yield (BS.replicate (512 - fileSize `mod` 512) 0)
+      pad fileSize
       return r
 
+    f (TarEntryProducer mkHeader content) = do
+      (r, bytes) <- Pipes.runWriterP $
+        Pipes.for (Pipes.hoist Pipes.lift content) tell
 
-----------------------------------------------------------------------------------
----- | Fold all 'Just BS.ByteString's into a single 'CompleteEntry' with file
----- related metadata.
---writeFileEntry
---    :: Monad m
---    => FilePath -> FileMode -> Int -> Int -> UTCTime
---    -> () -> Pipes.Pipe (Maybe BS.ByteString) CompleteEntry m ()
---writeFileEntry path mode uid gid modified () = do
---    content <- mconcat <$> requestAll
---    let header =
---            TarEntry { entryPath = path
---                     , entrySize = BS.length content
---                     , entryMode = mode
---                     , entryUID = uid
---                     , entryGID = gid
---                     , entryLastModified = modified
---                     , entryType = File
---                     , entryLinkName = ""
---                     }
---
---    Pipes.respond (CompleteEntry header content)
---
---  where
---
---    requestAll = go id
---      where
---        go diffAs = do
---            ma <- Pipes.request ()
---            case ma of
---                Nothing -> return (diffAs [])
---                Just a -> go (diffAs . (a:))
---
---
-----------------------------------------------------------------------------------
+      let fileSize = BS.length bytes
+      Pipes.yield (encodeTar $ mkHeader $ BS.length bytes)
+      Pipes.yield bytes
+      pad fileSize
+
+      return r
+
+    pad n | n `mod` 512 == 0 = return ()
+          | otherwise = Pipes.yield (BS.replicate (512 - n `mod` 512) 0)
+
+
+--------------------------------------------------------------------------------
+fileEntry
+    :: Monad m
+    => FilePath -> FileMode -> Int -> Int -> UTCTime
+    -> Pipes.Producer BS.ByteString m ()
+    -> TarArchive m
+fileEntry path mode uid gid modified contents =
+  TarArchive $ FreeT $ return $ Free $ TarEntryProducer
+    (\n -> TarHeader { entryPath = path
+                     , entrySize = n
+                     , entryMode = mode
+                     , entryUID = uid
+                     , entryGID = gid
+                     , entryLastModified = modified
+                     , entryType = File
+                     , entryLinkName = ""
+                     })
+    ((FreeT $ return $ Pure $ return ()) <$ contents)
+
+
+--------------------------------------------------------------------------------
 ---- | Produce a single 'CompleteEntry' with correct metadata for a directory.
 --writeDirectoryEntry
 --    :: Monad m
