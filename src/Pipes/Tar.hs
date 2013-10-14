@@ -372,20 +372,22 @@ writeTarArchive (TarArchive archive) = Parse.concat (transFreeT f (void archive)
 fileEntry
     :: Monad m
     => FilePath -> FileMode -> Int -> Int -> UTCTime
-    -> Pipes.Producer BS.ByteString m ()
+    -> m (Pipes.Producer BS.ByteString m ())
     -> TarArchive m
-fileEntry path mode uid gid modified contents =
-  TarArchive $ FreeT $ return $ Free $ TarEntryProducer
-    (\n -> TarHeader { entryPath = path
-                     , entrySize = n
-                     , entryMode = mode
-                     , entryUID = uid
-                     , entryGID = gid
-                     , entryLastModified = modified
-                     , entryType = File
-                     , entryLinkName = ""
-                     })
-    ((FreeT $ return $ Pure $ return ()) <$ contents)
+fileEntry path mode uid gid modified mkContents =
+  TarArchive $ FreeT $ do
+    contents <- mkContents
+    return $ Free $ TarEntryProducer
+      (\n -> TarHeader { entryPath = path
+                       , entrySize = n
+                       , entryMode = mode
+                       , entryUID = uid
+                       , entryGID = gid
+                       , entryLastModified = modified
+                       , entryType = File
+                       , entryLinkName = ""
+                       })
+      ((FreeT $ return $ Pure $ return ()) <$ contents)
 
 
 --------------------------------------------------------------------------------
