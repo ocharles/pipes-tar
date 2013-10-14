@@ -23,7 +23,7 @@ module Pipes.Tar
 --------------------------------------------------------------------------------
 import Control.Applicative
 import Control.Monad ((>=>), guard, join, unless, void)
-import Control.Monad.Trans.Free (FreeT(..), FreeF(..), iterT, transFreeT)
+import Control.Monad.Trans.Free (FreeT(..), FreeF(..), iterT, transFreeT, wrap)
 import Control.Monad.Writer.Class (tell)
 import Data.Char (digitToInt, intToDigit, isDigit, ord)
 import Data.Digits (digitsRev, unDigits)
@@ -387,28 +387,27 @@ fileEntry path mode uid gid modified mkContents =
                        , entryType = File
                        , entryLinkName = ""
                        })
-      ((FreeT $ return $ Pure $ return ()) <$ contents)
+      ((return (return ())) <$ contents)
 
 
 --------------------------------------------------------------------------------
----- | Produce a single 'CompleteEntry' with correct metadata for a directory.
---writeDirectoryEntry
---    :: Monad m
---    => FilePath -> FileMode -> Int -> Int -> UTCTime
---    -> Pipes.Producer CompleteEntry m ()
---writeDirectoryEntry path mode uid gid modified = do
---    let header =
---            TarEntry { entryPath = path
---                     , entrySize = 0
---                     , entryMode = mode
---                     , entryUID = uid
---                     , entryGID = gid
---                     , entryLastModified = modified
---                     , entryType = Directory
---                     , entryLinkName = ""
---                     }
---
---    Pipes.respond (CompleteEntry header mempty)
+directoryEntry
+    :: Monad m
+    => FilePath -> FileMode -> Int -> Int -> UTCTime
+    -> TarArchive m
+directoryEntry path mode uid gid modified =
+    let header =
+            TarHeader { entryPath = path
+                      , entrySize = 0
+                      , entryMode = mode
+                      , entryUID = uid
+                      , entryGID = gid
+                      , entryLastModified = modified
+                      , entryType = Directory
+                      , entryLinkName = ""
+                      }
+    in TarArchive $ wrap $ TarEntry header (return $ return $ return ())
+
 
 --------------------------------------------------------------------------------
 drawBytesUpTo
