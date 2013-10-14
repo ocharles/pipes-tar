@@ -1,3 +1,4 @@
+{-# LANGUAGE RankNTypes #-}
 {-|
     @pipes-tar@ is a library for the @pipes@-ecosystem that provides the ability
     to read from tar files in constant memory, and write tar files using as much
@@ -7,6 +8,7 @@ module Pipes.Tar
     ( -- * Reading
       -- $reading
       parseTarEntries
+    , iterTarArchive
 
       -- * Writing
       -- $writing
@@ -19,8 +21,8 @@ module Pipes.Tar
 
 --------------------------------------------------------------------------------
 import Control.Applicative
-import Control.Monad ((>=>), guard)
-import Control.Monad.Trans.Free (FreeT(..), FreeF(..))
+import Control.Monad ((>=>), guard, join, void)
+import Control.Monad.Trans.Free (FreeT(..), FreeF(..), iterT)
 import Control.Monad.Writer.Class (tell)
 import Data.Char (digitToInt, intToDigit, isDigit, ord)
 import Data.Digits (digitsRev, unDigits)
@@ -67,6 +69,19 @@ data TarEntry m r = TarEntry { tarHeader :: TarHeader
 
 instance Monad m => Functor (TarEntry m) where
   fmap f (TarEntry header r) = TarEntry header (fmap f r)
+
+----------------------------------------------------------------------------------
+newtype TarArchive m = TarArchive (FreeT (TarEntry m) m
+                                   (Pipes.Producer BS.ByteString m ()))
+
+iterTarArchive
+  :: Monad m
+  => (forall a. TarHeader -> Pipes.Consumer BS.ByteString m a)
+  -> TarArchive m -> m ()
+iterTarArchive mkConsumer (TarArchive free) = iterT iterator (void free)
+  where
+    iterator (TarEntry h content) = join $ Pipes.runEffect $
+      content Pipes.>-> mkConsumer h
 
 ----------------------------------------------------------------------------------
 --{- $reading
@@ -138,14 +153,14 @@ instance Monad m => Functor (TarEntry m) where
 --    run the entire producer, and make sure to 'join' the next entry.
 ---}
 parseTarEntries
-  :: (Functor m, Monad m)
-  => Pipes.Producer BS.ByteString m ()
-  -> FreeT (TarEntry m) m (Pipes.Producer BS.ByteString m ())
-parseTarEntries upstream = FreeT $ do
-  (headerBytes, rest) <- drawBytesUpTo 512 upstream
-  go headerBytes rest
+  :: (Functor m, Monad m) => Pipes.Producer BS.ByteString m () -> TarArchive m
+parseTarEntries = TarArchive . loop
 
  where
+
+  loop upstream = FreeT $ do
+    (headerBytes, rest) <- drawBytesUpTo 512 upstream
+    go headerBytes rest
 
   go headerBytes remainder
     | BS.length headerBytes < 512 =
@@ -165,7 +180,7 @@ parseTarEntries upstream = FreeT $ do
           Right header ->
             return $ Free $ TarEntry header $ parseBody header remainder
 
-  parseBody header = fmap parseTarEntries . produceBody
+  parseBody header = fmap loop . produceBody
 
    where
 
