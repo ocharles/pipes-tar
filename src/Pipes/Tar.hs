@@ -21,11 +21,13 @@ module Pipes.Tar
 import Control.Applicative
 import Control.Monad ((>=>), guard)
 import Control.Monad.Trans.Free (FreeT(..), FreeF(..))
+import Control.Monad.Writer.Class (tell)
 import Data.Char (digitToInt, intToDigit, isDigit, ord)
 import Data.Digits (digitsRev, unDigits)
 import Data.Monoid ((<>), mconcat, mempty)
 import Data.Time (UTCTime)
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime, utcTimeToPOSIXSeconds)
+import Data.Tuple (swap)
 import System.Posix.Types (CMode(..), FileMode)
 
 --------------------------------------------------------------------------------
@@ -33,6 +35,8 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as Char8
 import qualified Data.Serialize.Get as Get
 import qualified Pipes
+import qualified Pipes.Lift as Pipes
+import qualified Pipes.ByteString as PBS
 import qualified Pipes.Parse as Parse
 
 --------------------------------------------------------------------------------
@@ -78,7 +82,7 @@ instance Monad m => Functor (TarEntry m) where
 --    > import Control.Monad (void)
 --    > import Control.Monad.IO.Class (liftIO)
 --    > import Pipes
---    > import Pipes.ByteString (readHandle)
+--    > import Pipes.ByteString (fromHandle)
 --    > import Pipes.Parse (wrap)
 --    > import Pipes.Prelude (discard)
 --    > import Pipes.Tar
@@ -89,7 +93,7 @@ instance Monad m => Functor (TarEntry m) where
 --    > main = do
 --    >   (tarPath:_) <- getArgs
 --    >   withFile tarPath ReadMode $ \h ->
---    >     void $ iterT readEntry (parseTarEntry (readHandle h))
+--    >     void $ iterT readEntry (parseTarEntry (fromHandle h))
 --    >
 --    >  where
 --    >
@@ -98,9 +102,8 @@ instance Monad m => Functor (TarEntry m) where
 --    >     join (run (for k (const $ return ()))))
 --
 --    We use 'System.IO.withFile' to open a handle to the tar archive we wish to
---    read, and then 'Pipes.ByteString.readHandle' to stream the contents of this
---    handle into something that can work with @pipes@. We then convert a file
---    handle into a 'BS.ByteString' by using 'readHandle'.
+--    read, and then 'Pipes.ByteString.fromHandle' to stream the contents of this
+--    handle into something that can work with @pipes@.
 --
 --    As mentioned before, 'parseTarEntries' yields a free monad, and we can
 --    destruct this using 'iterT'. We pass 'iterT' a function to operate on each
@@ -139,7 +142,7 @@ parseTarEntries
   => Pipes.Producer BS.ByteString m ()
   -> FreeT (TarEntry m) m (Pipes.Producer BS.ByteString m ())
 parseTarEntries upstream = FreeT $ do
-  (headerBytes, rest) <- Parse.runStateT (drawBytesUpTo 512) upstream
+  (headerBytes, rest) <- drawBytesUpTo 512 upstream
   go headerBytes rest
 
  where
@@ -149,7 +152,7 @@ parseTarEntries upstream = FreeT $ do
         return $ Pure (Pipes.yield headerBytes >> remainder)
 
     | BS.all (== 0) headerBytes = do
-        (eofMarker, rest) <- Parse.runStateT (drawBytesUpTo 512) remainder
+        (eofMarker, rest) <- drawBytesUpTo 512 remainder
 
         return $ Pure $
           if BS.all (== 0) eofMarker
@@ -166,13 +169,13 @@ parseTarEntries upstream = FreeT $ do
 
    where
 
-    produceBody = yieldBytesUpTo (entrySize header) >=> consumePadding
+    produceBody = PBS.splitAt (entrySize header) >=> consumePadding
 
     consumePadding p
       | entrySize header == 0 = return p
       | otherwise =
           let padding = 512 - entrySize header `mod` 512
-          in Pipes.for (yieldBytesUpTo padding p) (const $ return ())
+          in Pipes.for (PBS.splitAt padding p) (const $ return ())
 
 --------------------------------------------------------------------------------
 {-serializeTarEntries-}
@@ -190,49 +193,6 @@ parseTarEntries upstream = FreeT $ do
       {-Pipes.yield (encodeTar header)-}
       {-b-}
     --Pipes.run body
-
---------------------------------------------------------------------------------
-drawBytesUpTo
-  :: (Functor m, Monad m)
-  => Int
-  -> Parse.StateT (Pipes.Producer BS.ByteString m r) m BS.ByteString
-drawBytesUpTo = loop mempty
-
- where
-
-  loop acc remaining
-    | remaining <= 0 = return acc
-    | otherwise = do
-        (bytes, suffix) <-
-          maybe (mempty, mempty) (BS.splitAt remaining) <$> Parse.draw
-        let acc' = acc <> bytes
-        if BS.null suffix
-            then loop acc' (remaining - BS.length bytes)
-            else Parse.unDraw suffix >> return acc'
-
-
---------------------------------------------------------------------------------
-yieldBytesUpTo
-  :: (Functor m, Monad m)
-  => Int
-  -> Pipes.Producer BS.ByteString m r
-  -> Pipes.Producer BS.ByteString m (Pipes.Producer BS.ByteString m r)
-yieldBytesUpTo = loop
-
- where
-
-  loop n p
-    | n == 0 = return p
-    | otherwise = do
-        stepped <- Pipes.lift (Pipes.next p)
-        case stepped of
-          Left r -> return (return r)
-          Right (produced, k) -> do
-            let (bytes, suffix) = BS.splitAt n produced
-            Pipes.yield (bytes :: BS.ByteString)
-            if BS.null suffix
-                then loop (n - BS.length bytes) k
-                else return (Pipes.yield suffix >> k)
 
 --------------------------------------------------------------------------------
 decodeTar :: BS.ByteString -> Either String TarHeader
@@ -450,3 +410,12 @@ encodeTar e =
 --            unless (fileSize `mod` 512 == 0) $
 --                Pipes.respond (BS.replicate (512 - fileSize `mod` 512) 0)
 --            writeTar ()
+
+--------------------------------------------------------------------------------
+drawBytesUpTo
+  :: (Integral n, Monad m, Functor m)
+  => n
+  -> Pipes.Producer PBS.ByteString m r
+  -> m (PBS.ByteString, Pipes.Producer PBS.ByteString m r)
+drawBytesUpTo n p = fmap swap $ Pipes.runEffect $ Pipes.runWriterP $
+  Pipes.for (Pipes.hoist Pipes.lift (PBS.splitAt n p)) tell
