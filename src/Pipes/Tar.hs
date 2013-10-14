@@ -115,13 +115,13 @@ iterTarArchive mkConsumer (TarArchive free) = iterT iterator (void free)
 --    > main = do
 --    >   (tarPath:_) <- getArgs
 --    >   withFile tarPath ReadMode $ \h ->
---    >     void $ iterT readEntry (parseTarEntry (fromHandle h))
+--    >     iterTarArchive readEntry (parseTarEntry (fromHandle h))
 --    >
 --    >  where
 --    >
---    >   readEntry (TarEntry header k) = do
---    >     putStrLn . entryPath $ header
---    >     join (run (for k (const $ return ()))))
+--    >   readEntry header = do
+--    >     liftIO (putStrLn . entryPath $ header)
+--    >     forever await
 --
 --    We use 'System.IO.withFile' to open a handle to the tar archive we wish to
 --    read, and then 'Pipes.ByteString.fromHandle' to stream the contents of this
@@ -146,12 +146,12 @@ iterTarArchive mkConsumer (TarArchive free) = iterT iterator (void free)
 --    > import Data.List (isSuffixOf)
 --    > ...
 --    >  where
---    >   readEntry (TarEntry header k) =
+--    >   readEntry header =
 --    >     let reader = if ".txt" `isSuffixOf` entryPath tarEntry &&
 --    >                       entryType tarEntry == File =
---    >                    then lift . putStrLn
---    >                    else (const (return ()))
---    >     in join (run (for k reader))
+--    >                    then print
+--    >                    else forever await
+--    >     in reader
 --
 --    We now have two branches in @readEntry@ - and we choose a branch depending
 --    on whether or not we are looking at a file with a file name ending in
@@ -199,22 +199,6 @@ parseTarEntries = TarArchive . loop
           let padding = 512 - entrySize header `mod` 512
           in Pipes.for (PBS.splitAt padding p) (const $ return ())
 
---------------------------------------------------------------------------------
-{-serializeTarEntries-}
-  {-:: Monad m-}
-  {-=> FreeT (TarEntry m) m (Pipes.Producer BS.ByteString m ())-}
-  {--> Pipes.Producer BS.ByteString m ()-}
-{-serializeTarEntries freed = join . Pipes.lift . iterT iterator-}
-
- {-where-}
-
-  {-iterator (TarEntry header body) = do-}
-    {-b <- body-}
-    {-return body-}
-    {-return $ do-}
-      {-Pipes.yield (encodeTar header)-}
-      {-b-}
-    --Pipes.run body
 
 --------------------------------------------------------------------------------
 decodeTar :: BS.ByteString -> Either String TarHeader
@@ -418,24 +402,6 @@ writeTarArchive (TarArchive archive) = Parse.concat (transFreeT f (void archive)
 --                     }
 --
 --    Pipes.respond (CompleteEntry header mempty)
---
---
-----------------------------------------------------------------------------------
----- | Convert a stream of 'Nothing' terminated 'CompleteEntry's into a
----- 'BS.ByteString' stream. Terminates after writing the EOF marker when the
----- first 'Nothing' value is consumed.
---writeTar :: Monad m => () -> Pipes.Pipe (Maybe CompleteEntry) BS.ByteString m ()
---writeTar () = do
---    entry <- Pipes.request ()
---    case entry of
---        Nothing -> Pipes.respond (BS.replicate 1024 0)
---        Just (CompleteEntry header content) -> do
---            let fileSize = entrySize header
---            Pipes.respond (encodeTar header)
---            Pipes.respond content
---            unless (fileSize `mod` 512 == 0) $
---                Pipes.respond (BS.replicate (512 - fileSize `mod` 512) 0)
---            writeTar ()
 
 --------------------------------------------------------------------------------
 drawBytesUpTo
