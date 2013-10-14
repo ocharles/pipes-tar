@@ -12,6 +12,7 @@ module Pipes.Tar
 
       -- * Writing
       -- $writing
+    , writeTarArchive
 
       -- * 'TarEntry'
     , TarHeader(..)
@@ -21,15 +22,16 @@ module Pipes.Tar
 
 --------------------------------------------------------------------------------
 import Control.Applicative
-import Control.Monad ((>=>), guard, join, void)
-import Control.Monad.Trans.Free (FreeT(..), FreeF(..), iterT)
+import Control.Monad ((>=>), guard, join, unless, void)
+import Control.Monad.Trans.Free (FreeT(..), FreeF(..), iterT, transFreeT)
 import Control.Monad.Writer.Class (tell)
 import Data.Char (digitToInt, intToDigit, isDigit, ord)
 import Data.Digits (digitsRev, unDigits)
-import Data.Monoid ((<>), mconcat, mempty)
+import Data.Monoid ((<>), mconcat, Sum(..))
 import Data.Time (UTCTime)
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime, utcTimeToPOSIXSeconds)
 import Data.Tuple (swap)
+import Pipes ((>->))
 import System.Posix.Types (CMode(..), FileMode)
 
 --------------------------------------------------------------------------------
@@ -38,6 +40,7 @@ import qualified Data.ByteString.Char8 as Char8
 import qualified Data.Serialize.Get as Get
 import qualified Pipes
 import qualified Pipes.Lift as Pipes
+import qualified Pipes.Prelude as Pipes
 import qualified Pipes.ByteString as PBS
 import qualified Pipes.Parse as Parse
 
@@ -295,66 +298,70 @@ encodeTar e =
 
 
 ----------------------------------------------------------------------------------
---{- $writing
---    Like reading, writing tar files is done using @writeEntry@ type functions for
---    the individual files inside a tar archive, and a final 'writeTar' 'P.Pipe' to
---    produce a correctly formatted stream of 'BS.ByteString's.
---
---    However, unlike reading, writing tar files can be done entirely with *pull
---    composition*. Here's an example of producing a tar archive with one file in a
---    directory:
---
---    > import Data.Text
---    > import Data.Text.Encoding (encodeUtf8)
---    > import Pipes
---    > import Pipes.ByteString (writeHandle)
---    > import Pipes.Parse (wrap)
---    > import Pipes.Tar
---    > import Data.Time (getCurrentTime)
---    > import System.IO (withFile, IOMode(WriteMode))
---    >
---    > main :: IO ()
---    > main = withFile "hello.tar" WriteMode $ \h ->
---    >   runEffect $
---    >     (wrap . tarEntries >-> writeTar >-> writeHandle h) ()
---    >
---    >  where
---    >
---    >   tarEntries () = do
---    >     now <- lift getCurrentTime
---    >     writeDirectoryEntry "text" 0 0 0 now
---    >     writeFileEntry "text/hello" 0 0 0 now <-<
---    >       (wrap . const (respond (encodeUtf8 "Hello!"))) $ ()
---
---    First, lets try and understand @tarEntries@, as this is the bulk of the work.
---    @tarEntries@ is a 'Pipes.Producer', which is responsible for producing
---    'CompleteEntry's for 'writeTar' to consume. A 'CompleteEntry' is a
---    combination of a 'TarEntry' along with any associated data. This bundled is
---    necessary to ensure that when writing the tar, we don't produce a header
---    where the size header itself doesn't match the actual amount of data that
---    follows. It's for this reason 'CompleteEntry''s constructor is private - you
---    can only respond with 'CompleteEntry's using primitives provided by
---    @pipes-tar@.
---
---    The first primitive we use is 'writeDirectory', which takes no input and
---    responds with a directory entry. The next response is a little bit more
---    complicated. Here, I'm writing a text file to the path \"text/hello\" with the
---    contents \"Hello!\". 'writeFileEntry' is a 'Pipes.Pipe' that consumes a
---    'Nothing' terminated stream of 'BS.ByteStrings', and responds with a
---    corresponding 'CompleteEntry'. I've used flipped pull combination ('Pipes.<-<') to
---    avoid more parenthesis, and 'Pipes.Parse.wrap' a single 'respond' call which
---    produces the actual file contents.
----}
---
---
-----------------------------------------------------------------------------------
----- | A 'CompleteEntry' is a 'TarEntry' along with any corresponding data. These
----- values are constructed using the @writeEntry@ family of functions (e.g.,
----- 'writeFileEntry').
---data CompleteEntry = CompleteEntry TarEntry BS.ByteString
---  deriving (Eq, Show)
---
---
+{- $writing
+    Like reading, writing tar files is done using @writeEntry@ type functions for
+    the individual files inside a tar archive, and a final 'writeTar' 'P.Pipe' to
+    produce a correctly formatted stream of 'BS.ByteString's.
+
+    However, unlike reading, writing tar files can be done entirely with *pull
+    composition*. Here's an example of producing a tar archive with one file in a
+    directory:
+
+    > import Data.Text
+    > import Data.Text.Encoding (encodeUtf8)
+    > import Pipes
+    > import Pipes.ByteString (writeHandle)
+    > import Pipes.Parse (wrap)
+    > import Pipes.Tar
+    > import Data.Time (getCurrentTime)
+    > import System.IO (withFile, IOMode(WriteMode))
+    >
+    > main :: IO ()
+    > main = withFile "hello.tar" WriteMode $ \h ->
+    >   runEffect $
+    >     (wrap . tarEntries >-> writeTar >-> writeHandle h) ()
+    >
+    >  where
+    >
+    >   tarEntries () = do
+    >     now <- lift getCurrentTime
+    >     writeDirectoryEntry "text" 0 0 0 now
+    >     writeFileEntry "text/hello" 0 0 0 now <-<
+    >       (wrap . const (respond (encodeUtf8 "Hello!"))) $ ()
+
+    First, lets try and understand @tarEntries@, as this is the bulk of the work.
+    @tarEntries@ is a 'Pipes.Producer', which is responsible for producing
+    'CompleteEntry's for 'writeTar' to consume. A 'CompleteEntry' is a
+    combination of a 'TarEntry' along with any associated data. This bundled is
+    necessary to ensure that when writing the tar, we don't produce a header
+    where the size header itself doesn't match the actual amount of data that
+    follows. It's for this reason 'CompleteEntry''s constructor is private - you
+    can only respond with 'CompleteEntry's using primitives provided by
+    @pipes-tar@.
+
+    The first primitive we use is 'writeDirectory', which takes no input and
+    responds with a directory entry. The next response is a little bit more
+    complicated. Here, I'm writing a text file to the path \"text/hello\" with the
+    contents \"Hello!\". 'writeFileEntry' is a 'Pipes.Pipe' that consumes a
+    'Nothing' terminated stream of 'BS.ByteStrings', and responds with a
+    corresponding 'CompleteEntry'. I've used flipped pull combination ('Pipes.<-<') to
+    avoid more parenthesis, and 'Pipes.Parse.wrap' a single 'respond' call which
+    produces the actual file contents.
+-}
+writeTarArchive
+  :: Monad m
+  => TarArchive m -> Pipes.Producer BS.ByteString m ()
+writeTarArchive (TarArchive archive) = Parse.concat (transFreeT f (void archive))
+  where
+    f (TarEntry h content) = do
+      Pipes.yield (encodeTar h)
+      (r, Sum fileSize) <- Pipes.runWriterP $
+        Pipes.hoist Pipes.lift content >-> Pipes.chain (tell . Sum . BS.length)
+      unless (fileSize `mod` 512 == 0) $
+          Pipes.yield (BS.replicate (512 - fileSize `mod` 512) 0)
+      return r
+
+
 ----------------------------------------------------------------------------------
 ---- | Fold all 'Just BS.ByteString's into a single 'CompleteEntry' with file
 ---- related metadata.
@@ -428,8 +435,8 @@ encodeTar e =
 
 --------------------------------------------------------------------------------
 drawBytesUpTo
-  :: (Integral n, Monad m, Functor m)
-  => n
+  :: (Monad m, Functor m)
+  => Int
   -> Pipes.Producer PBS.ByteString m r
   -> m (PBS.ByteString, Pipes.Producer PBS.ByteString m r)
 drawBytesUpTo n p = fmap swap $ Pipes.runEffect $ Pipes.runWriterP $
