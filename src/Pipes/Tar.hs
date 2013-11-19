@@ -18,6 +18,12 @@ module Pipes.Tar
     , TarHeader(..)
     , TarEntry, tarHeader, tarContent
     , EntryType(..)
+
+      -- ** Constructing 'TarEntry's
+    , directoryEntry
+    , fileEntry
+
+    , TarArchive(..)
     ) where
 
 --------------------------------------------------------------------------------
@@ -70,13 +76,9 @@ data TarEntry m r
   = TarEntry { tarHeader :: TarHeader
              , tarContent :: Pipes.Producer BS.ByteString m r
              }
-  | TarEntryProducer { mkTarHeader :: Int -> TarHeader
-                     , tarContent :: Pipes.Producer BS.ByteString m r
-                     }
 
 instance Monad m => Functor (TarEntry m) where
   fmap f (TarEntry header r) = TarEntry header (fmap f r)
-  fmap f (TarEntryProducer mkHeader r) = TarEntryProducer mkHeader (fmap f r)
 
 ----------------------------------------------------------------------------------
 newtype TarArchive m = TarArchive (FreeT (TarEntry m) m
@@ -86,14 +88,11 @@ instance Monad m => Monoid (TarArchive m) where
   (TarArchive a) `mappend` (TarArchive b) = TarArchive (a >> b)
   mempty = TarArchive (return (return ()))
 
-iterTarArchive
-  :: Monad m
-  => (forall a. TarHeader -> Pipes.Consumer BS.ByteString m a)
-  -> TarArchive m -> m ()
-iterTarArchive mkConsumer (TarArchive free) = iterT iterator (void free)
-  where
-    iterator (TarEntry h content) = join $ Pipes.runEffect $
-      content Pipes.>-> mkConsumer h
+--iterTarArchive
+--  :: (Pipes.MonadCatch m, Monad m, Pipes.MonadIO m)
+--  => (TarEntry m a -> m a)
+--  -> TarArchive m -> m ()
+iterTarArchive f (TarArchive free) = iterT f (void free)
 
 ----------------------------------------------------------------------------------
 --{- $reading
@@ -346,19 +345,12 @@ writeTarArchive
   => TarArchive m -> Pipes.Producer BS.ByteString m ()
 writeTarArchive (TarArchive archive) = Parse.concat (transFreeT f (void archive))
   where
-    f (TarEntry h content) = do
-      Pipes.yield (encodeTar h)
-      (r, Sum fileSize) <- Pipes.runWriterP $
-        Pipes.hoist Pipes.lift content >-> Pipes.chain (tell . Sum . BS.length)
-      pad fileSize
-      return r
-
-    f (TarEntryProducer mkHeader content) = do
+    f (TarEntry header content) = do
       (r, bytes) <- Pipes.runWriterP $
         Pipes.for (Pipes.hoist Pipes.lift content) tell
 
       let fileSize = BS.length bytes
-      Pipes.yield (encodeTar $ mkHeader $ BS.length bytes)
+      Pipes.yield (encodeTar $ header { entrySize = BS.length bytes })
       Pipes.yield bytes
       pad fileSize
 
@@ -377,16 +369,16 @@ fileEntry
 fileEntry path mode uid gid modified mkContents =
   TarArchive $ FreeT $ do
     contents <- mkContents
-    return $ Free $ TarEntryProducer
-      (\n -> TarHeader { entryPath = path
-                       , entrySize = n
-                       , entryMode = mode
-                       , entryUID = uid
-                       , entryGID = gid
-                       , entryLastModified = modified
-                       , entryType = File
-                       , entryLinkName = ""
-                       })
+    return $ Free $ TarEntry
+      (TarHeader { entryPath = path
+                 , entrySize = 0 -- This will get replaced when we write the archive
+                 , entryMode = mode
+                 , entryUID = uid
+                 , entryGID = gid
+                 , entryLastModified = modified
+                 , entryType = File
+                 , entryLinkName = ""
+                 })
       ((return (return ())) <$ contents)
 
 
